@@ -25,7 +25,7 @@ public class EndpointTests
     }
 
     [Fact]
-    public async Task Accept_json_returns_a_json_summary_instead_of_an_ack()
+    public async Task Accept_json_returns_a_receipt_instead_of_an_ack()
     {
         using var server = new TestServer();
         var result = await server.PostText(ValidOru, accept: "application/json");
@@ -33,12 +33,12 @@ public class EndpointTests
         Assert.Equal(200, result.StatusCode);
         using var json = JsonDocument.Parse(result.Body);
         var root = json.RootElement;
-        Assert.Equal("accepted", root.GetProperty("status").GetString());
+        Assert.Equal("received", root.GetProperty("status").GetString());
         Assert.Equal("AA", root.GetProperty("ackCode").GetString());
         Assert.Equal("CTRL-1", root.GetProperty("messageControlId").GetString());
         Assert.Equal("WOODBINE", root.GetProperty("sender").GetProperty("facility").GetString());
-        Assert.Equal(1, root.GetProperty("reports").GetInt32());
         Assert.Equal(result.MessageId, root.GetProperty("messageId").GetInt64().ToString());
+        Assert.Equal($"/messages/{result.MessageId}", root.GetProperty("href").GetString());
     }
 
     [Fact]
@@ -48,7 +48,7 @@ public class EndpointTests
         var result = await server.PostText(ValidOru);
 
         var segments = result.Body.TrimEnd('\r').Split('\r');
-        Assert.Equal(2, segments.Length); // MSH + MSA, no ERR on success
+        Assert.Equal(2, segments.Length); // MSH + MSA
         var msh = segments[0].Split('|');
         Assert.Equal("MSH", msh[0]);
         Assert.Equal("^~\\&", msh[1]);
@@ -58,7 +58,7 @@ public class EndpointTests
         Assert.Equal("ACK^R01^ACK", msh[8]);
         Assert.Equal("P", msh[10]);
         Assert.Equal("2.5", msh[11]);
-        Assert.Equal("MSA|AA|CTRL-1|", segments[1]);
+        Assert.Equal("MSA|AA|CTRL-1|Received", segments[1]);
     }
 
     [Theory]
@@ -69,8 +69,7 @@ public class EndpointTests
         using var server = new TestServer();
         var result = await server.PostText(ValidOru.Replace("\r", terminator));
 
-        Assert.Equal("AA", result.AckCode);
-        Assert.Equal("accepted", (string)server.Message(result.MessageId)!.status);
+        Assert.Equal("accepted", result.Status);
     }
 
     [Fact]
@@ -81,7 +80,7 @@ public class EndpointTests
         var body = Encoding.Latin1.GetBytes(ValidOru.Replace("DOE^JANE", "CÔTÉ^RENÉ"));
         var result = await server.Post(body);
 
-        Assert.Equal("AA", result.AckCode);
+        Assert.Equal("accepted", result.Status);
         Assert.Equal("CÔTÉ", server.Scalar<string>("SELECT patient_family_name FROM reports"));
         Assert.Equal("RENÉ", server.Scalar<string>("SELECT patient_given_name FROM reports"));
     }
@@ -94,7 +93,7 @@ public class EndpointTests
         var body = Encoding.Latin1.GetBytes(withCharset.Replace("DOE^JANE", "CÔTÉ^RENÉ"));
         var result = await server.Post(body);
 
-        Assert.Equal("AA", result.AckCode);
+        Assert.Equal("accepted", result.Status);
         Assert.Equal("CÔTÉ", server.Scalar<string>("SELECT patient_family_name FROM reports"));
     }
 
@@ -105,7 +104,7 @@ public class EndpointTests
         var text = ValidOru.Replace("||Normal.||||||F", "||Line one\\.br\\Line two \\T\\ pipe \\F\\ done||||||F");
         var result = await server.PostText(text);
 
-        Assert.Equal("AA", result.AckCode);
+        Assert.Equal("accepted", result.Status);
         Assert.Equal("Line one\nLine two & pipe | done", server.Scalar<string>("SELECT value FROM observations"));
     }
 
@@ -119,7 +118,7 @@ public class EndpointTests
             "OBX|2|TX|71046^CHEST 2 VIEWS^CPT||Second study, second line.||||||F\r";
         var result = await server.PostText(text);
 
-        Assert.Equal("AA", result.AckCode);
+        Assert.Equal("accepted", result.Status);
         var reports = server.Query("SELECT * FROM reports ORDER BY sequence").ToList();
         Assert.Equal(2, reports.Count);
         Assert.Equal("ACC1", (string)reports[0].accession_number);
@@ -135,7 +134,7 @@ public class EndpointTests
         var text = ValidOru.Replace("PT1^^^WOODBINE^MR", "PT1^^^WOODBINE^MR~1234567890^^^ON^JHN");
         var result = await server.PostText(text);
 
-        Assert.Equal("AA", result.AckCode);
+        Assert.Equal("accepted", result.Status);
         Assert.Equal("PT1", server.Scalar<string>("SELECT patient_identifier FROM reports"));
         Assert.Equal("MR", server.Scalar<string>("SELECT patient_identifier_type FROM reports"));
     }
@@ -151,10 +150,10 @@ public class EndpointTests
         using var server = new TestServer();
         var result = await server.PostText(ValidOru.Replace(find, replace));
 
-        Assert.Equal(200, result.StatusCode);
-        Assert.Equal("AE", result.AckCode);
+        Assert.Equal(200, result.StatusCode);   // still received — validity is not the receiver's concern
+        Assert.Equal("AA", result.AckCode);
+        Assert.Equal("rejected", result.Status);
         var row = server.Message(result.MessageId)!;
-        Assert.Equal("rejected", (string)row.status);
         Assert.Equal(code, (string)row.rejection_code);
         Assert.Contains(detailContains, (string)row.detail);
     }
@@ -170,7 +169,7 @@ public class EndpointTests
             "OBR|1|ORD1^RIS|ACC1^RIS|71020^CHEST^CPT|||20260101115500\r";
         var result = await server.PostText(text);
 
-        Assert.Equal("AE", result.AckCode);
+        Assert.Equal("rejected", result.Status);
         Assert.Equal("SEGMENT_SEQUENCE", (string)server.Message(result.MessageId)!.rejection_code);
     }
 
@@ -183,7 +182,7 @@ public class EndpointTests
             + "NTE|1||Dictated by Dr. Smith.\rZDS|1.2.840.113619.2.55.3^WOODBINE^APPLICATION^DICOM\r";
         var result = await server.PostText(text);
 
-        Assert.Equal("AA", result.AckCode);
+        Assert.Equal("accepted", result.Status);
         Assert.Equal(1, server.Scalar<long>("SELECT COUNT(*) FROM reports"));
     }
 

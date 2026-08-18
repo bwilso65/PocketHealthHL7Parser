@@ -4,7 +4,8 @@ namespace Hl7Receiver.Storage;
 /// SQLite schema. Applied with CREATE ... IF NOT EXISTS on startup (no migration framework — see README).
 ///
 /// Three tables:
-///   messages      — every payload ever received, raw, with an outcome (audit trail + quarantine + idempotency)
+///   messages      — every payload ever received, raw, with an outcome. Doubles as the durable processing queue
+///                   (status = received) and the quarantine (status = rejected / failed).
 ///   reports       — one row per OBR in an accepted message: the report a clinician/patient would look at
 ///   observations  — one row per OBX under a report (preserves structure; reports.report_text is the joined narrative)
 /// </summary>
@@ -13,14 +14,15 @@ public static class Schema
     public const string Sql = """
         CREATE TABLE IF NOT EXISTS messages (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            received_at         TEXT    NOT NULL,   -- ISO-8601 UTC, server clock
-            sending_application TEXT,               -- MSH-3
-            sending_facility    TEXT,               -- MSH-4  (the provider)
+            received_at         TEXT    NOT NULL,   -- ISO-8601 UTC, server clock, when the bytes were stored
+            processed_at        TEXT,               -- ISO-8601 UTC, when the worker reached a verdict
+            sending_application TEXT,               -- MSH-3   (best-effort from the raw header at receipt)
+            sending_facility    TEXT,               -- MSH-4   (the provider)
             message_control_id  TEXT,               -- MSH-10
             message_type        TEXT,               -- MSH-9 as sent, e.g. ORU^R01
             processing_id       TEXT,               -- MSH-11 (P/T/D)
             hl7_version         TEXT,               -- MSH-12
-            status              TEXT    NOT NULL,   -- accepted | duplicate | rejected
+            status              TEXT    NOT NULL,   -- received | accepted | duplicate | rejected | failed
             rejection_code      TEXT,               -- e.g. UNPARSEABLE, UNSUPPORTED_MESSAGE_TYPE (status = rejected only)
             detail              TEXT,               -- human-readable reason / note
             duplicate_of        INTEGER REFERENCES messages(id),  -- status = duplicate: the accepted original
@@ -35,7 +37,7 @@ public static class Schema
             WHERE status = 'accepted';
 
         CREATE INDEX IF NOT EXISTS ix_messages_received_at ON messages (received_at);
-        CREATE INDEX IF NOT EXISTS ix_messages_status      ON messages (status);
+        CREATE INDEX IF NOT EXISTS ix_messages_status      ON messages (status, id);   -- the worker's queue scan
 
         CREATE TABLE IF NOT EXISTS reports (
             id                          INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -3,40 +3,22 @@ using System.Text;
 namespace Hl7Receiver.Hl7;
 
 /// <summary>
-/// Builds the HL7 acknowledgement returned to the sender (MSH + MSA [+ ERR]). Built by hand rather than with the
-/// library so it also works when the inbound message did not parse — <see cref="MessageHeader.Sniff"/> gives us
-/// whatever MSH fields were readable, and the ACK is as informative as the input allowed.
+/// Builds the HL7 acknowledgement returned to the sender the moment its bytes are safely stored.
+///
+/// Processing is asynchronous, so the ACK is a *receipt*, not a verdict: <c>MSA-1 = AA</c> with MSA-3 "Received".
+/// (HL7's precise term for "committed to safe storage, application processing pending" is <c>CA</c>, but that code
+/// only exists in enhanced-acknowledgement mode — MSH-15 set — and Woodbine sends original mode, where the sender
+/// expects <c>AA</c>. Standard interface-engine behaviour is to ACK <c>AA</c> on receipt and handle later processing
+/// failures on the receiver's side, which is what we do.)
+///
+/// Built by hand rather than with the library so it also works when the inbound message is unparseable —
+/// <see cref="MessageHeader.Sniff"/> gives us whatever MSH fields were readable.
 /// </summary>
 public sealed class AckBuilder(string ourApplication = "POCKETHEALTH", string ourFacility = "POCKETHEALTH", TimeProvider? clock = null)
 {
-    private static readonly IReadOnlyDictionary<string, string> Table0357 = new Dictionary<string, string>
-    {
-        ["0"] = "Message accepted",
-        ["100"] = "Segment sequence error",
-        ["101"] = "Required field missing",
-        ["102"] = "Data type error",
-        ["103"] = "Table value not found",
-        ["200"] = "Unsupported message type",
-        ["201"] = "Unsupported event code",
-        ["202"] = "Unsupported processing id",
-        ["203"] = "Unsupported version id",
-        ["204"] = "Unknown key identifier",
-        ["205"] = "Duplicate key identifier",
-        ["206"] = "Application record locked",
-        ["207"] = "Application internal error",
-    };
-
     private readonly TimeProvider _clock = clock ?? TimeProvider.System;
 
-    /// <summary>Positive acknowledgement. <paramref name="note"/> goes to MSA-3 (e.g. "duplicate; not reprocessed").</summary>
-    public string Accept(MessageHeader original, string? note = null) =>
-        Build(original, AckCode.AA, note, hl7ErrorCode: null);
-
-    /// <summary>Negative acknowledgement carrying the rejection reason in MSA-3 and an ERR segment.</summary>
-    public string Reject(MessageHeader original, Rejection rejection) =>
-        Build(original, rejection.Ack, rejection.Detail, rejection.Hl7ErrorCode);
-
-    private string Build(MessageHeader original, AckCode code, string? text, string? hl7ErrorCode)
+    public string Received(MessageHeader original, string note = "Received")
     {
         var now = _clock.GetUtcNow().ToString("yyyyMMddHHmmss") + "+0000";
         var messageType = original.TriggerEvent is null ? "ACK" : $"ACK^{Escape(original.TriggerEvent)}^ACK";
@@ -55,19 +37,10 @@ public sealed class AckBuilder(string ourApplication = "POCKETHEALTH", string ou
           .Append(Escape(original.VersionId ?? "2.5"))
           .Append('\r');
 
-        sb.Append("MSA|").Append(code).Append('|')
+        sb.Append("MSA|AA|")
           .Append(Escape(original.MessageControlId)).Append('|')
-          .Append(Escape(text))
+          .Append(Escape(note))
           .Append('\r');
-
-        if (hl7ErrorCode is not null)
-        {
-            var description = Table0357.TryGetValue(hl7ErrorCode, out var d) ? d : "Error";
-            // ERR-3: HL7 error code (table 0357); ERR-4: severity (E = error); ERR-8: user message
-            sb.Append("ERR|||").Append(hl7ErrorCode).Append('^').Append(Escape(description)).Append("^HL70357|E||||")
-              .Append(Escape(text))
-              .Append('\r');
-        }
 
         return sb.ToString();
     }

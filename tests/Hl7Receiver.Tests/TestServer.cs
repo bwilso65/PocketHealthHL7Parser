@@ -9,8 +9,8 @@ using Microsoft.Extensions.DependencyInjection;
 namespace Hl7Receiver.Tests;
 
 /// <summary>
-/// Boots the real application in-process against a throwaway SQLite file.
-/// Each instance gets its own database so tests can run in parallel and inspect state independently.
+/// Boots the real application in-process (including the background processing worker) against a throwaway SQLite
+/// file. Each instance gets its own database so tests can run in parallel and inspect state independently.
 /// </summary>
 public sealed class TestServer : IDisposable
 {
@@ -18,10 +18,15 @@ public sealed class TestServer : IDisposable
 
     public string DbPath { get; }
     public HttpClient Client { get; }
+    public IServiceProvider Services => _factory.Services;
 
-    public TestServer(Action<IServiceCollection>? configureServices = null)
+    /// <summary>Set to false to leave the database on disk after Dispose (restart scenarios).</summary>
+    public bool DeleteDatabaseOnDispose { get; set; } = true;
+
+    /// <param name="dbPath">Reuse an existing database file (simulates a restart against the same data).</param>
+    public TestServer(Action<IServiceCollection>? configureServices = null, string? dbPath = null)
     {
-        DbPath = Path.Combine(Path.GetTempPath(), "hl7receiver-tests", $"{Guid.NewGuid():N}.db");
+        DbPath = dbPath ?? Path.Combine(Path.GetTempPath(), "hl7receiver-tests", $"{Guid.NewGuid():N}.db");
 
         _factory = new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
@@ -45,9 +50,10 @@ public sealed class TestServer : IDisposable
 
     // ---- HTTP helpers ----------------------------------------------------------------------------
 
-    public sealed record PostResult(int StatusCode, string Body, string? MessageId)
+    /// <param name="Status">Final <c>messages.status</c> after processing (null if the POST didn't create a message).</param>
+    public sealed record PostResult(int StatusCode, string Body, string? MessageId, string? Status)
     {
-        /// <summary>MSA-1 from an HL7 ACK body ("AA", "AE", "AR"), or null if the body isn't an ACK.</summary>
+        /// <summary>MSA-1 from an HL7 ACK body, or null if the body isn't an ACK.</summary>
         public string? AckCode
         {
             get
@@ -58,11 +64,14 @@ public sealed class TestServer : IDisposable
         }
     }
 
-    public Task<PostResult> PostSample(string fileName, string? accept = null) => Post(Sample(fileName), accept);
+    /// <summary>POSTs a sample and, by default, waits until the background worker has reached a verdict.</summary>
+    public Task<PostResult> PostSample(string fileName, string? accept = null, bool waitForProcessing = true) =>
+        Post(Sample(fileName), accept, waitForProcessing);
 
-    public Task<PostResult> PostText(string hl7, string? accept = null) => Post(Encoding.UTF8.GetBytes(hl7), accept);
+    public Task<PostResult> PostText(string hl7, string? accept = null, bool waitForProcessing = true) =>
+        Post(Encoding.UTF8.GetBytes(hl7), accept, waitForProcessing);
 
-    public async Task<PostResult> Post(byte[] body, string? accept = null)
+    public async Task<PostResult> Post(byte[] body, string? accept = null, bool waitForProcessing = true)
     {
         using var content = new ByteArrayContent(body);
         content.Headers.ContentType = new MediaTypeHeaderValue("text/plain");
@@ -75,7 +84,34 @@ public sealed class TestServer : IDisposable
         using var response = await Client.SendAsync(request);
         var text = await response.Content.ReadAsStringAsync();
         response.Headers.TryGetValues("X-Message-Id", out var ids);
-        return new PostResult((int)response.StatusCode, text, ids?.FirstOrDefault());
+        var id = ids?.FirstOrDefault();
+
+        string? status = null;
+        if (id is not null && waitForProcessing)
+        {
+            status = await WaitProcessed(id);
+        }
+
+        return new PostResult((int)response.StatusCode, text, id, status);
+    }
+
+    /// <summary>Polls until the worker has moved the message out of 'received'. Processing normally takes milliseconds.</summary>
+    public async Task<string> WaitProcessed(string messageId, TimeSpan? timeout = null)
+    {
+        var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
+        while (true)
+        {
+            var status = (string?)Message(messageId)?.status;
+            if (status is not null && status != "received")
+            {
+                return status;
+            }
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException($"Message {messageId} was not processed within the timeout (status: {status ?? "missing"})");
+            }
+            await Task.Delay(10);
+        }
     }
 
     // ---- DB helpers ------------------------------------------------------------------------------
@@ -102,6 +138,10 @@ public sealed class TestServer : IDisposable
         Client.Dispose();
         _factory.Dispose();
         SqliteConnection.ClearAllPools();
+        if (!DeleteDatabaseOnDispose)
+        {
+            return;
+        }
         try
         {
             foreach (var f in Directory.GetFiles(Path.GetDirectoryName(DbPath)!, Path.GetFileName(DbPath) + "*"))

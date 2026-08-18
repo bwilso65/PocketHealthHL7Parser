@@ -8,10 +8,10 @@ namespace Hl7Receiver.Storage;
 /// </summary>
 public sealed class MessageQueries(Database database)
 {
-    public static readonly string[] Statuses = ["accepted", "duplicate", "rejected"];
+    public static readonly string[] Statuses = ["received", "accepted", "duplicate", "rejected", "failed"];
 
     private const string SummaryColumns = """
-        m.id, m.received_at, m.sending_application, m.sending_facility, m.message_control_id, m.message_type,
+        m.id, m.received_at, m.processed_at, m.sending_application, m.sending_facility, m.message_control_id, m.message_type,
         m.processing_id, m.hl7_version, m.status, m.rejection_code, m.detail, m.duplicate_of, m.raw_sha256,
         (SELECT COUNT(*) FROM reports r WHERE r.message_id = m.id) AS report_count
         """;
@@ -55,7 +55,7 @@ public sealed class MessageQueries(Database database)
                 .ToList()))
             .ToList();
 
-        return new MessageView(m.Id, m.ReceivedAt, m.Status, new SenderView(m.SendingApplication, m.SendingFacility),
+        return new MessageView(m.Id, m.ReceivedAt, m.ProcessedAt, m.Status, new SenderView(m.SendingApplication, m.SendingFacility),
             m.MessageControlId, m.MessageType, m.ProcessingId, m.Hl7Version, Rejection(m), m.DuplicateOf, m.Detail,
             m.RawSha256, reports);
     }
@@ -86,7 +86,7 @@ public sealed class MessageQueries(Database database)
             """,
             new { ControlId = controlId, Facility = facility, Status = status, Limit = limit });
 
-        return rows.Select(m => new MessageSummaryView(m.Id, m.ReceivedAt, m.Status,
+        return rows.Select(m => new MessageSummaryView(m.Id, m.ReceivedAt, m.ProcessedAt, m.Status,
                 new SenderView(m.SendingApplication, m.SendingFacility), m.MessageControlId, m.MessageType,
                 m.ProcessingId, m.Hl7Version, Rejection(m), m.DuplicateOf, m.Detail, m.RawSha256, m.ReportCount))
             .ToList();
@@ -101,6 +101,7 @@ public sealed class MessageQueries(Database database)
     {
         public long Id { get; set; }
         public string ReceivedAt { get; set; } = string.Empty;
+        public string? ProcessedAt { get; set; }
         public string? SendingApplication { get; set; }
         public string? SendingFacility { get; set; }
         public string? MessageControlId { get; set; }

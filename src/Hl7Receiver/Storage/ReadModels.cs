@@ -6,7 +6,8 @@ namespace Hl7Receiver.Storage;
 public sealed record MessageSummaryView(
     long Id,
     string ReceivedAt,
-    string Status,                 // accepted | duplicate | rejected
+    string? ProcessedAt,           // null while status = received
+    string Status,                 // received | accepted | duplicate | rejected | failed
     SenderView Sender,
     string? MessageControlId,
     string? MessageType,
@@ -21,6 +22,7 @@ public sealed record MessageSummaryView(
 public sealed record MessageView(
     long Id,
     string ReceivedAt,
+    string? ProcessedAt,
     string Status,
     SenderView Sender,
     string? MessageControlId,

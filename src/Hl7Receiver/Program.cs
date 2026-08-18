@@ -19,12 +19,20 @@ builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton(new Database(dbPath));
 builder.Services.AddSingleton<MessageRepository>();
 builder.Services.AddSingleton<MessageQueries>();
+
+// HL7 pipeline pieces (stateless)
 builder.Services.AddSingleton<Hl7Parser>();
 builder.Services.AddSingleton<OruExtractor>();
 builder.Services.AddSingleton<OruValidator>();
 builder.Services.AddSingleton<IProviderProfileRegistry>(new ProviderProfileRegistry());
 builder.Services.AddSingleton(sp => new AckBuilder(receivingApplication, receivingFacility, sp.GetRequiredService<TimeProvider>()));
-builder.Services.AddSingleton<IngestionService>();
+
+// Receive (hot path) → queue → process (background)
+builder.Services.AddSingleton<ProcessingQueue>();
+builder.Services.AddSingleton<MessageReceiver>();
+builder.Services.AddSingleton<MessageProcessor>();
+builder.Services.AddSingleton<ProcessingWorker>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ProcessingWorker>());
 
 var app = builder.Build();
 
@@ -37,15 +45,16 @@ app.MapGet("/", () => Results.Text(
     HL7 ORU^R01 ingestion server
 
       POST /messages                 raw HL7 v2 message in the body (Content-Type: text/plain).
-                                     Returns an HL7 ACK, or JSON with 'Accept: application/json'.
-      GET  /messages/{id}            outcome of a message + extracted report(s)   (id from X-Message-Id)
+                                     200 + HL7 ACK (AA "Received") once the bytes are stored; processing is async.
+                                     JSON instead of the ACK with 'Accept: application/json'.
+      GET  /messages/{id}            outcome of a message + extracted report(s)   (id from X-Message-Id / Location)
       GET  /messages/{id}/raw        the exact bytes received
       GET  /messages?controlId=&facility=&status=&limit=   search (newest first)
-      GET  /healthz                  liveness
+      GET  /healthz                  liveness + queue depth
 
     Or query SQLite directly: docker compose exec hl7-server sqlite3 /app/data/messages.db
     """, "text/plain"));
-app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
+app.MapGet("/healthz", (MessageRepository repository) => Results.Ok(new { status = "ok", pending = repository.CountPending() }));
 app.MapMessagesEndpoint();
 
 app.Run();
