@@ -17,7 +17,7 @@ section says what was delegated and what wasn't. This file is one of the deliver
 
 ## Log
 
-### 2026-08-18 — Session 1: read, clarify, scaffold
+### 2026-08-18 — Session 1: read, clarify, scaffold, build
 
 - Read the brief and scaffold. Scaffold README fixes the ingress contract: `POST /messages`, `Content-Type: text/plain`,
   port 8080, env `DB_PATH` / `PORT`, `./data` bind mount. That means **HL7 over HTTP**, not MLLP — flagged as the #1
@@ -28,18 +28,28 @@ section says what was delegated and what wasn't. This file is one of the deliver
 - Wrote the ambiguity list (transport, ACK expectations, encoding, batching, message-type scope, required-field policy,
   duplicate semantics, sender identity, data model, timezone, sync/async, HTTP status semantics, escapes, auth/PHI).
   Split it into (a) decisions only I can make, (b) questions for Maya, (c) engineering defaults I'll take and defend.
-- Drafted a per-sample behavior matrix (below, "Decision log" D5) as the working hypothesis, pending Maya's answers.
 - Environment check: Docker Desktop present; **no Go / .NET SDK / sqlite3 CLI locally**. Decision: build and iterate
   entirely inside Docker (the image is the deliverable anyway).
-- Researched C# HL7 parsers (see D3). Downloaded and read the chosen library's parser/validation source to know exactly
-  what it enforces and what it leaves to us.
+- Researched C# HL7 parsers (see D3). Downloaded and read the chosen library's parser/validation/serialization source
+  to know exactly what it enforces, what it leaves to us, and that escape decoding round-trips.
 - Scaffolded the solution with the .NET 10 SDK container, wrote Dockerfile (multi-stage: build → test → publish →
   runtime with `sqlite3` CLI), compose (`hl7-server` + a `tests` profile), config plumbing, SQLite bootstrap (WAL),
   `/healthz`, and a smoke test. Verified: `docker compose --profile test run --rm tests` passes;
   `docker compose up --build` is healthy; DB appears in `./data`; `docker compose exec hl7-server sqlite3 ...` works.
-- Drafted the questions for Maya's assistant (transport, interface spec, report format, amendments, identifiers,
-  ACK/retry, error handling, volume, encoding/TZ, security, go-live process, the other 3 providers). Domain logic is
-  paused until the design-changing answers are back.
+- **Talked to Maya's assistant.** What came back (full log is on the take-home page):
+  - Woodbine sends **HTTP POST, synchronously**; **their sender retries on non-2xx** → answer 2xx once we've
+    accepted the message, even if processing isn't finished. Sync vs async processing is my call.
+  - Volume ~50/day → ~500/day in 6 months, can burst. Timezone almost certainly Eastern. Encoding unknown.
+  - "Viewed in the database" = backend only; a SQL query showing patient + report is enough. No UI.
+  - Provider flexibility for the next three: "leadership wants this to be *the* standard pattern"; rigid vs
+    hooks-for-quirks is my architecture call — document it here.
+  - She could not answer (would need Daniel at Woodbine): prelim/final/addenda workflow, which fields carry accession
+    and patient ID, whether they expect a standard HL7 ACK and their retry policy, error queue / who to notify, ADT
+    plans, real-time vs batched, latency expectations. Her steer: **pick sensible defaults, document them, list what
+    to confirm before go-live.** Done — README "Assumptions to confirm with Woodbine before go-live".
+- Built the pipeline (`Hl7/`, `Ingestion/`, `Storage/`, `Http/`) and the tests: 53 tests, all green in Docker on
+  the first full run. Ran the real demo: `docker compose up --build`, `scripts/send-samples.sh`, `scripts/show-db.sh`
+  — the ACKs and the DB match the behaviour matrix. Wrote README.
 
 ## Decision log
 
@@ -53,45 +63,102 @@ Format: what / why / what was rejected / what would change it.
   compose profile. (For the live session I'd install the SDK locally for a fast loop; behavior is identical.)
 - **D3 — HL7 parsing: `HL7-V2` (Efferent, NuGet `HL7-V2` 3.8.0, MIT, zero dependencies), not nHapi, not hand-rolled.**
   It is deliberately schema-free ("not tied to any HL7 version nor validates against one"): it splits segments on
-  `\r`/`\n`/`\r\n`, reads delimiters from MSH-2, decodes escape sequences, gives path access (`PID.5.1`),
-  repetitions, ACK/NACK generation, HL7 timestamp parsing, and MLLP frame extraction. Its baseline validation is
-  small and known (read the source): starts with `MSH`, MSH has ≥ 11 field separators, MSH-9/10/11 non-empty, segment
-  names match `[A-Z][A-Z][A-Z1-9]`, 4th char of every segment equals the field delimiter. It does **not** enforce
-  message structure, reject a second MSH, require OBX-11, or check message type — so **the strict-vs-lenient policy is
-  ours to write and defend**, which is exactly what this exercise is about. Rejected: nHapi 3.2.4 (MPL-2.0; full HAPI
-  port with generated per-version models — schema-aware and strict by default, which fights the "every provider has
-  quirks" reality and adds a lot of surface area for a receiver that mostly needs ~15 fields); hand-rolled (fine for
-  these 8 files, but escapes, repetitions, sub-components, and Z-segments make it grow fast). Would change if: we needed
-  strict conformance profiles per provider (then nHapi's validation model earns its weight).
+  `\r`/`\n`/`\r\n`, reads delimiters from MSH-2, decodes escape sequences (and re-encodes them symmetrically, so parsing
+  round-trips), gives path access (`PID.5.1`), repetitions, HL7 timestamp parsing, and MLLP frame extraction. Its
+  baseline validation is small and known (read the source): starts with `MSH`, MSH has ≥ 11 field separators,
+  MSH-9/10/11 non-empty, segment names match `[A-Z][A-Z][A-Z1-9]`, 4th char of every segment equals the field
+  delimiter. It does **not** enforce message structure, reject a second MSH, require OBX-11, or check message type —
+  so **the strict-vs-lenient policy is ours to write and defend**, which is exactly what this exercise is about.
+  Rejected: nHapi 3.2.4 (MPL-2.0; full HAPI port with generated per-version models — schema-aware and strict by
+  default, which fights the "every provider has quirks" reality and adds a lot of surface area for a receiver that
+  mostly needs ~15 fields); hand-rolled (fine for these 8 files, but escapes, repetitions, sub-components, and
+  Z-segments make it grow fast). Would change if: we needed strict conformance profiles per provider (then nHapi's
+  validation model earns its weight). One quirk found by reading the source: it decodes `\.br\` to a literal `<BR>`;
+  we map that to `\n` in the extractor. We build the ACK by hand (20 lines) rather than with the library so the same
+  code path works for unparseable input.
 - **D4 — Storage: `Microsoft.Data.Sqlite` + Dapper, hand-written SQL, `CREATE ... IF NOT EXISTS` on startup.** Small,
   transparent, and easy to extend live. WAL mode so the DB can be inspected while the server writes. Rejected: EF Core
   (migrations + model ceremony for ~3 tables); a bare `SqliteCommand` everywhere (Dapper removes boilerplate without
   hiding SQL). Would change if: the schema starts evolving in production — then a real migration tool.
-- **D5 — Behavior matrix for the samples (working hypothesis; revisit after Maya).** Underlying principle: **every
-  payload is stored raw with a status** (`accepted` / `duplicate` / `rejected` + error), so rejecting is never data
-  loss — it's quarantine with replay. Idempotency key = (sending facility, sending app, control ID), not control ID
-  alone (two providers can both send `MSG00001`).
-  | # | Sample | Behavior | Why |
+- **D5 — Behaviour matrix for the samples.** Underlying principle: **every payload is stored raw with a status**
+  (`accepted` / `duplicate` / `rejected` + reason), so rejecting is never data loss — it's quarantine with replay.
+  Idempotency key = (sending facility, sending app, control ID), not control ID alone (two providers can both send
+  `MSG00001`); only *accepted* rows participate, so a corrected re-send of a rejected message can be accepted.
+  | # | Sample | Behaviour | Why |
   |---|---|---|---|
   | 01–03 | valid | accept | 03 proves sender is a first-class column, not a hard-coded "WOODBINE" |
   | 04 | duplicate control ID, different body | idempotent success; store receipt as `duplicate`; flag body-hash mismatch | sender retries until success — a failure response creates a retry loop; never silently overwrite a stored report with different content |
-  | 05 | broken MSH | reject (unparseable) | can't identify the message |
-  | 06 | two messages in one payload | reject whole payload | one POST = one message; can't return one honest ACK for two control IDs; splitting hides a sender bug; taking only the first silently loses a report. Raw kept. |
-  | 07 | truncated in OBX-5 | reject (invalid) | OBX-11 (result status, HL7-required) missing → treat as incomplete. A partial radiology report stored as complete is a patient-safety issue |
-  | 08 | ADT^A01 | reject (unsupported type) | not a report |
-  Open until Maya answers: exact response body format; whether 06 should be split; whether ADT is wanted later.
+  | 05 | broken MSH | reject `UNPARSEABLE` (AR) | can't identify the message; sender still sniffed from the partial MSH |
+  | 06 | two messages in one payload | reject whole payload `MULTIPLE_MSH` (AR) | one POST = one message; can't return one honest ACK for two control IDs; splitting hides a sender bug; taking only the first silently loses a report. Raw kept. |
+  | 07 | truncated in OBX-5 | reject `REQUIRED_FIELD_MISSING` OBX-11 (AE) | OBX-11 (result status, HL7-required) missing → treat as incomplete. A partial radiology report stored as complete is a patient-safety issue |
+  | 08 | ADT^A01 | reject `UNSUPPORTED_MESSAGE_TYPE` (AR) | not a report; HL7 table 0357 code 200 |
+  AE vs AR follows HL7's intent: AR = "can't/won't process this kind of thing" (syntax, type, structure), AE = "understood it, content isn't acceptable" (missing required field). Both come back with an `ERR` segment carrying a table-0357 code.
+- **D6 — HTTP status = commit level; ACK code = application verdict. `200` for anything durably stored, even rejects.**
+  This changed after Maya: "their sender will retry on non-2xx." A permanently-bad message answered with `4xx` would
+  be retried forever. So `200` means "we have your bytes" (verdict in `MSA-1`), `400` only for an empty body,
+  `5xx` (unhandled → default handler) when we couldn't persist — the one case where a retry is right. This is also
+  how HL7-over-HTTP implementations behave and mirrors HL7's own commit-ack / application-ack split. Rejected:
+  `400/422` for rejections (better REST hygiene, wrong for this sender). Mitigation for the "200 hides failures"
+  worry: rejections are loud — `AE/AR` + `ERR` in the body, `status=rejected` + reason in the DB, warning-level
+  structured log lines, and a JSON summary via `Accept: application/json`. Would change if: Woodbine's engine turns
+  out to key off HTTP status *and* not retry 4xx — then 4xx for AE/AR is a one-line change in `MessagesEndpoint`.
+- **D7 — Synchronous processing.** Parse + validate + insert is sub-millisecond; 50→500/day with bursts is nowhere
+  near SQLite's single-writer limit; a synchronous ACK reflects what actually happened. The `messages` table is
+  already shaped like a queue (raw + status), so an async worker is an additive change if latency SLOs appear.
+- **D8 — Provider flexibility: a `ProviderProfile` (validation policy + field mapping) resolved by MSH-4, default for
+  everyone today.** Answering Maya's "rigid pipeline vs hooks for quirks": the pipeline is fixed
+  (decode → parse → validate → extract → persist → ACK) and the *knobs* are data — which message types, which fields
+  are required, where the accession number and patient ID live. That is where provider quirks actually show up. No
+  config file yet (nothing to configure: Woodbine fits the default, and the other three are unknown), but the seam is
+  real and tested (`Provider_profile_override_changes_field_mapping_for_that_sender_only`). Rejected: per-provider
+  code paths (diverge fast, untestable) and a fully generic mapping DSL (YAGNI with one provider).
+- **D9 — Charset handling: MSH-18 if declared and known, else strict UTF-8, else ISO-8859-1 fallback.** Maya
+  doesn't know Woodbine's encoding; the samples are UTF-8. Lenient UTF-8 decoding would silently turn a Windows-1252
+  `é` into U+FFFD *and store it* — the fallback keeps accented names readable, and the raw bytes are stored regardless
+  so a wrong guess is recoverable. Logged as a warning when the fallback fires.
+- **D10 — Data model.** `messages` (raw + outcome) → `reports` (one per OBR: patient snapshot from PID, order/procedure
+  from OBR, `report_text` = OBX-5 values newline-joined) → `observations` (one per OBX). Patient demographics are a
+  *snapshot on the report*, not a patient master (identity resolution across MRNs/health-card numbers is a
+  downstream concern and needs ADT). Timestamps → ISO-8601 with the precision sent and **no invented offset** (Maya:
+  "almost certainly Eastern" is documented, not baked in). Column named `accession_number` (meaning) rather than
+  `filler_order_number` (source) because the *mapping* is the provider-specific part and the table should be canonical.
+
+## Live-session prep notes (for me)
+
+Likely "extend it live" asks and where they land: MLLP listener (`Ingestion` is transport-agnostic; library has
+`MessageHelper.ExtractMessages`); a new provider with a quirk (`ProviderProfileRegistry` override); accept `ADT`
+(policy + a new extractor); read endpoint (`Dapper` query in `Http/`); auth (middleware); async worker (`messages`
+as queue); amendments (`OBX-11 = C`, `OBR-25`, latest-per-accession view).
 
 ## AI usage
 
 - Tool: **Claude Code (Claude Fable 5)**, in this repo, as a pair programmer. This whole file is written with it open.
-- What it did so far: read the samples byte-by-byte and produced the line-ending/encoding census; drafted the ambiguity
-  list and the Maya questions (I edited and chose which to ask); researched the parser libraries and pulled the
-  chosen library's source so we could read its validation logic instead of guessing; scaffolded the solution,
-  Dockerfile, compose, DB bootstrap, and smoke tests; keeps this log.
+- What it did: read the samples byte-by-byte and produced the line-ending/encoding census; drafted the ambiguity list
+  and the Maya questions (I edited and chose which to ask); researched the parser libraries and pulled the chosen
+  library's source so we could read its validation/serialization logic instead of guessing; scaffolded the solution,
+  Dockerfile, compose; wrote the first draft of every source file, the tests, the demo scripts, and this log and the
+  README, iterating in Docker.
 - What I did: made every decision in the decision log; chose the language for the live session; chose to build only
-  inside Docker; pushed for a library over a hand-rolled parser; own the conversation with Maya's assistant.
-- What I deliberately did *not* delegate: the strict-vs-lenient policy per sample. The AI proposed a matrix; I'm
-  treating each row as a call I have to be able to defend, and several are waiting on Maya's answers.
+  inside Docker; pushed for a library over a hand-rolled parser; ran the conversation with Maya's assistant and fed
+  the answers back (which flipped D6); reviewed the code as it landed.
+- What I deliberately did *not* delegate: the strict-vs-lenient policy per sample and the HTTP/ACK contract. The AI
+  proposed a matrix; each row is a call I have to be able to defend, and D6 in particular changed after talking to Maya.
+- Dead ends the AI helped avoid: it found `HL7-dotnetcore` was deprecated before we depended on it; it read the
+  library's `Encode`/`Decode` to confirm escaped text round-trips before we relied on that; it caught the `<BR>` quirk.
+
+## Prompt log (abridged)
+
+The substantive prompts, in order. Everything else was "run it / fix that / next".
+
+1. Set up a memory file for a multi-session take-home; push back hard on ambiguity; prep for follow-up questions on
+   changing requirements and design rationale.
+2. Pasted the assignment brief + noted the scaffold and samples. → Ambiguity list, per-sample behaviour hypothesis,
+   prioritized questions for Maya, proposed structure.
+3. Decisions: C#; iterate entirely in Docker; ignore the time cap; find a lightweight C# HL7 parser with room for
+   custom overrides; HTTP responses to Woodbine, then persist. → Library research (HL7-dotnetcore deprecated →
+   HL7-V2; nHapi as heavyweight alternative), scaffold, Docker loop proven, first commit.
+4. Pasted the Maya's-assistant conversation. → Response contract flipped to 200-for-stored (D6); pipeline, schema,
+   tests, demo scripts, README written and verified in Docker.
 
 ## Dead ends / backed out
 
@@ -99,3 +166,7 @@ Format: what / why / what was rejected / what would change it.
   same maintainer; switched before writing any code.
 - Started with `UseUrls` to honor `PORT`; the aspnet base image already sets `ASPNETCORE_HTTP_PORTS`, so that logged
   an override warning on every start. Switched to setting `HTTP_PORTS` from `PORT` instead.
+- First plan had `4xx` for rejected messages (honest REST). Maya's "sender retries on non-2xx" made that a retry
+  storm; replaced with `200 + AE/AR` and made rejections loud elsewhere (D6).
+- Tried mapping a nullable value tuple from Dapper for the duplicate check; swapped for a tiny mapping class rather
+  than find out how Dapper feels about `Nullable<ValueTuple>` at demo time.
