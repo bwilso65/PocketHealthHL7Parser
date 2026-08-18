@@ -263,6 +263,17 @@ The substantive prompts, in order. Everything else was "run it / fix that / next
    the receiver with proper ACKs for invalid/unparseable/corrupt messages; raw bytes into `messages` fast; only the
    `reports` population async. → The AI owned the miss, then rebuilt: shared `MessageEvaluator`, sync validate +
    store + honest ACK, worker writes reports; D7 rewritten with the full arc.
+8. Added four items to "what I'd do with more time": per-provider API keys (generate/validate/revoke), signed
+   responses, webhooks for processing updates, per-provider validation extensions. → Written up with the concrete
+   mechanism for each and grouped (trust/security → provider integration → operations → data).
+9. "Is anything missing from the core functionality that would stop this from being accepted?" → A verify-don't-opine
+   audit: brief line by line, then a fresh `git clone` into a scratch directory run the way a reviewer would (tests,
+   `docker compose up --build`, POST/GET, the scripts). Found and fixed: `.sh` scripts committed without the exec bit
+   (Windows git), commit hashes cited in the docs that had gone dangling after my author rewrite, BOM/UTF-16/leading
+   blank line turning a valid hand-made message into `AR`, SQLite sidecar files not ignored, README test count.
+   Verified: `linux-musl-arm64` SQLite native present, no `.db` tracked, samples byte-identical after clone. Folded in
+   my WAL→rollback-journal change and the PowerShell `show-db.ps1`. Then `git push origin main`; v0.1 release to
+   follow, deliberately not tagged yet.
 
 ## Dead ends / backed out
 
