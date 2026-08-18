@@ -247,7 +247,9 @@ retries/backoff for `failed`; enhanced-mode `CA` acks if a provider sets MSH-15.
 
 ## Prompt log (abridged)
 
-The substantive prompts, in order. Everything else was "run it / fix that / next".
+The substantive prompts, in order, with what each produced. Everything else was "run it / fix that / next".
+**The raw, verbatim prompts for this session are in [PROMPT_LOG.md](PROMPT_LOG.md)** — every message I typed,
+including the pasted brief and the Maya's-assistant transcripts, unedited.
 
 1. Set up a memory file for a multi-session take-home; push back hard on ambiguity; prep for follow-up questions on
    changing requirements and design rationale.
@@ -283,6 +285,7 @@ The substantive prompts, in order. Everything else was "run it / fix that / next
 10. Made one more assumption explicit: auto-incrementing integer IDs are a deliberate demo-readability choice; a
     real deployment would expose generated non-enumerable ids on anything an endpoint returns. → README (decisions
     + "more time" under trust/security), PLAN D10.
+11. Asked for a link to the raw, verbatim prompt log of the session. → [PROMPT_LOG.md](PROMPT_LOG.md).
 
 ## Dead ends / backed out
 
