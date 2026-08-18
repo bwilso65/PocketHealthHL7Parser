@@ -16,9 +16,16 @@ namespace Hl7Receiver.Http;
 /// commit-ack vs application-ack.
 ///
 /// Response body: HL7 ACK (text/plain) by default; JSON with <c>Accept: application/json</c> for humans and tooling.
+///
+/// GET /messages/{id}        — what happened to a message, plus the extracted report(s) if it was accepted
+/// GET /messages/{id}/raw    — the exact bytes we received (inspect a quarantined message)
+/// GET /messages?controlId=&amp;facility=&amp;status=&amp;limit=  — find messages by what the sender knows (MSH-10)
 /// </summary>
 public static class MessagesEndpoint
 {
+    private const int DefaultLimit = 50;
+    private const int MaxLimit = 500;
+
     public static IEndpointRouteBuilder MapMessagesEndpoint(this IEndpointRouteBuilder app)
     {
         app.MapPost("/messages", async (HttpRequest request, HttpResponse response, IngestionService ingestion, CancellationToken ct) =>
@@ -37,6 +44,7 @@ public static class MessagesEndpoint
 
             var result = ingestion.Ingest(body);
             response.Headers["X-Message-Id"] = result.MessageId.ToString();
+            response.Headers.Location = $"/messages/{result.MessageId}";
 
             if (WantsJson(request))
             {
@@ -52,6 +60,7 @@ public static class MessagesEndpoint
                     duplicateOf = result.DuplicateOf,
                     payloadDiffersFromOriginal = result.Status == MessageStatus.Duplicate ? result.PayloadDiffersFromOriginal : (bool?)null,
                     rejection = result.Rejection is null ? null : new { code = result.Rejection.Code, hl7ErrorCode = result.Rejection.Hl7ErrorCode, detail = result.Rejection.Detail },
+                    href = $"/messages/{result.MessageId}",
                 }, statusCode: StatusCodes.Status200OK);
             }
 
@@ -59,6 +68,26 @@ public static class MessagesEndpoint
         })
         .WithName("PostMessage")
         .Accepts<string>("text/plain", "application/hl7-v2", "x-application/hl7-v2+er7", "application/octet-stream");
+
+        app.MapGet("/messages/{id:long}", (long id, MessageQueries queries) =>
+            queries.GetById(id) is { } message ? Results.Json(message) : Results.NotFound())
+            .WithName("GetMessage");
+
+        app.MapGet("/messages/{id:long}/raw", (long id, MessageQueries queries) =>
+            queries.GetRaw(id) is { } raw ? Results.Bytes(raw, "text/plain") : Results.NotFound())
+            .WithName("GetMessageRaw");
+
+        app.MapGet("/messages", (string? controlId, string? facility, string? status, int? limit, MessageQueries queries) =>
+        {
+            if (status is not null && !MessageQueries.Statuses.Contains(status, StringComparer.OrdinalIgnoreCase))
+            {
+                return Results.Problem($"status must be one of: {string.Join(", ", MessageQueries.Statuses)}", statusCode: StatusCodes.Status400BadRequest);
+            }
+
+            var effectiveLimit = Math.Clamp(limit ?? DefaultLimit, 1, MaxLimit);
+            return Results.Json(queries.Search(controlId, facility, status?.ToLowerInvariant(), effectiveLimit));
+        })
+        .WithName("SearchMessages");
 
         return app;
     }

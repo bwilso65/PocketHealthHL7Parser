@@ -18,7 +18,7 @@ The server listens on `http://localhost:8080`. The database is `./data/messages.
 ## Test
 
 ```bash
-# Unit + integration tests (53), inside Docker
+# Unit + integration tests (61), inside Docker
 docker compose --profile test run --rm tests
 
 # Post every sample message and print the ACK for each
@@ -29,10 +29,19 @@ scripts/send-samples.sh --json     # JSON summaries instead of HL7 ACKs
 scripts/show-db.sh
 ```
 
-Or by hand:
+Or by hand — send one, then look it up (the `X-Message-Id` / `Location` header on the POST tells you where):
 
 ```bash
 curl -i -X POST http://localhost:8080/messages -H "Content-Type: text/plain" --data-binary @samples/02_oru_valid_01.hl7
+curl -s http://localhost:8080/messages/1              # outcome + patient + report + observations, as JSON
+curl -s http://localhost:8080/messages/1/raw          # the exact bytes we received
+curl -s "http://localhost:8080/messages?controlId=MSG00001"          # by the sender's control ID (MSH-10)
+curl -s "http://localhost:8080/messages?status=rejected&limit=20"    # what's in quarantine
+```
+
+Or straight from SQLite:
+
+```bash
 docker compose exec hl7-server sqlite3 -header -column /app/data/messages.db \
   "SELECT id, sending_facility, message_control_id, status, rejection_code FROM messages;"
 docker compose exec hl7-server sqlite3 -header -column /app/data/messages.db \
@@ -58,6 +67,15 @@ POST /messages  ──▶ decode bytes ──▶ sniff MSH ──▶ parse ─�
 Every request lands in `messages` with `status ∈ {accepted, duplicate, rejected}`, the raw bytes, and a reason.
 Accepted messages additionally produce `reports` (one per OBR, with the patient snapshot and the newline-joined
 report text) and `observations` (one per OBX). Schema: [Schema.cs](src/Hl7Receiver/Storage/Schema.cs).
+
+**Reading it back** (JSON):
+
+| Endpoint | Returns |
+|---|---|
+| `GET /messages/{id}` | outcome (status, rejection reason, duplicate-of) + the extracted reports: patient, procedure, report text, observations |
+| `GET /messages/{id}/raw` | the exact bytes received — inspect a quarantined message |
+| `GET /messages?controlId=&facility=&status=&limit=` | search, newest first; `controlId` is what the sender knows (MSH-10) and is only unique per `facility` |
+| `GET /healthz` | liveness |
 
 ### Behaviour for the sample messages
 
@@ -109,10 +127,13 @@ sub-components, escapes, Z-segments), and every bug is ours.
 
 Smaller calls: synchronous processing (parse + persist is sub-millisecond; 50–500 msgs/day with bursts is far
 below SQLite's single-writer ceiling; the ACK reflects what actually happened); SQLite in WAL mode with
-`CREATE IF NOT EXISTS` at startup (no migration tool yet); denormalized `report_text` on `reports` for the obvious
-query, `observations` rows to keep structure; timestamps stored as ISO-8601 with the precision sent and **no
+`CREATE IF NOT EXISTS` at startup (no migration tool yet); **normalized tables, not a JSON blob** — `messages` /
+`reports` / `observations` are what you'd query on day one ("reports for this patient", "rejections from this
+provider this week"), the raw bytes are kept alongside for anything the schema doesn't capture, and a denormalized
+`report_text` on `reports` serves the obvious read; timestamps stored as ISO-8601 with the precision sent and **no
 invented timezone**; PID demographics stored as a snapshot on the report (no patient master — identity matching is
-downstream's job).
+downstream's job); a read API keyed by **our** message id (what the POST hands back) *and* searchable by the
+**sender's** control ID (what Woodbine's ops would quote us) — because both conversations happen.
 
 ## Assumptions to confirm with Woodbine before go-live
 
@@ -124,6 +145,8 @@ Maya's assistant could not answer these; the defaults below are documented in co
 | Accession number = OBR-3.1 (filler order number) | `ProviderProfile.Default` | Change one `FieldRef` |
 | Patient identifier = PID-3.1 (first repetition, MRN) | `ProviderProfile.Default` | Same |
 | A standard HL7 ACK is expected; sender retries on non-2xx | Maya | Response mapping is one class (`MessagesEndpoint`) |
+| Woodbine's engine *reads* the ACK (`MSA-1`/`ERR`) and someone monitors `AE`/`AR` — otherwise our rejections are invisible to them | Maya couldn't say | Add rejection alerting on our side and/or a notification path to their ops (see below) |
+| Their engine treats a `200 + AE/AR` as "delivered, don't retry" and error-queues it | Maya couldn't say | If it retries on non-AA, duplicates of rejected messages are harmless here (they're not deduplicated) but noisy |
 | Encoding UTF-8 unless MSH-18 says otherwise | `PayloadDecoder` | Add the charset to the switch |
 | Timestamps are Eastern (Ontario) but sent without offset | stored as-is | Apply the offset at read time / add a per-provider TZ |
 | Only `ORU^R01`; ADT is out of scope | `ValidationPolicy.Default` | Add the type to `AcceptedMessageTypes` and an extractor |
@@ -144,8 +167,9 @@ Maya's assistant could not answer these; the defaults below are documented in co
   message yields new report rows; add a "latest per (facility, accession)" view or an explicit supersedes link.
 - **Async option for bursts.** Persist raw and answer `200` immediately, process from the `messages` table in a
   background worker (it is already shaped like a queue). Not needed at 500/day, cheap to add if latency SLOs appear.
-- **Read API.** `GET /reports?accession=…`, `GET /messages/{id}` (raw + outcome). Backend-only was the ask; SQL is
-  enough for the demo.
+- **Report-centric reads.** Today's API is message-centric (what was sent, what happened). Add
+  `GET /reports?accession=…&patientId=…&facility=…` for the PocketHealth-side question ("this patient's reports"),
+  with paging.
 - **Provider profiles from configuration/DB** instead of code, with per-provider validation policies and a small
   admin surface. Contract test suites per provider from real de-identified samples.
 - **Embedded documents.** Radiology reports often arrive as base64 PDFs in an `ED` OBX; store them as blobs/files.
@@ -157,7 +181,8 @@ Maya's assistant could not answer these; the defaults below are documented in co
 - Layout: `src/Hl7Receiver/{Hl7,Ingestion,Storage,Http}`; `Program.cs` is just wiring. Tests are in
   `tests/Hl7Receiver.Tests` — the eight samples are copied in as fixtures and drive
   [`SampleBehaviorTests`](tests/Hl7Receiver.Tests/SampleBehaviorTests.cs); `EndpointTests` covers the leniency and
-  the provider seam; `UnitTests` covers the ACK builder, MSH sniffing, timestamps.
+  the provider seam; `ReadEndpointTests` covers the GET API; `UnitTests` covers the ACK builder, MSH sniffing,
+  timestamps.
 - Built and tested entirely inside Docker (no local SDK); what you run is what I ran.
 - AI use (Claude Code) is described in [PLAN.md](PLAN.md), including what was deliberately not delegated.
 - The container runs as root so the `./data` bind mount works on any host without permission games; a hardened

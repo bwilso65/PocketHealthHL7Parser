@@ -18,6 +18,7 @@ builder.WebHost.UseSetting(WebHostDefaults.HttpPortsKey, port);
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton(new Database(dbPath));
 builder.Services.AddSingleton<MessageRepository>();
+builder.Services.AddSingleton<MessageQueries>();
 builder.Services.AddSingleton<Hl7Parser>();
 builder.Services.AddSingleton<OruExtractor>();
 builder.Services.AddSingleton<OruValidator>();
@@ -35,11 +36,14 @@ app.MapGet("/", () => Results.Text(
     """
     HL7 ORU^R01 ingestion server
 
-      POST /messages   raw HL7 v2 message in the body (Content-Type: text/plain). Returns an HL7 ACK,
-                       or JSON with 'Accept: application/json'.
-      GET  /healthz    liveness
+      POST /messages                 raw HL7 v2 message in the body (Content-Type: text/plain).
+                                     Returns an HL7 ACK, or JSON with 'Accept: application/json'.
+      GET  /messages/{id}            outcome of a message + extracted report(s)   (id from X-Message-Id)
+      GET  /messages/{id}/raw        the exact bytes received
+      GET  /messages?controlId=&facility=&status=&limit=   search (newest first)
+      GET  /healthz                  liveness
 
-    Data: sqlite3 on the file at DB_PATH (see README for queries).
+    Or query SQLite directly: docker compose exec hl7-server sqlite3 /app/data/messages.db
     """, "text/plain"));
 app.MapGet("/healthz", () => Results.Ok(new { status = "ok" }));
 app.MapMessagesEndpoint();

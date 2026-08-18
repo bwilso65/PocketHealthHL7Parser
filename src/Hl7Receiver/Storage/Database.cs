@@ -13,6 +13,12 @@ public sealed class Database
 
     public string Path { get; }
 
+    static Database()
+    {
+        // Columns are snake_case (received_at); read-model properties are PascalCase (ReceivedAt).
+        DefaultTypeMap.MatchNamesWithUnderscores = true;
+    }
+
     public Database(string path)
     {
         Path = path;

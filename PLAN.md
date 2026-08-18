@@ -50,6 +50,18 @@ section says what was delegated and what wasn't. This file is one of the deliver
 - Built the pipeline (`Hl7/`, `Ingestion/`, `Storage/`, `Http/`) and the tests: 53 tests, all green in Docker on
   the first full run. Ran the real demo: `docker compose up --build`, `scripts/send-samples.sh`, `scripts/show-db.sh`
   — the ACKs and the DB match the behaviour matrix. Wrote README.
+- **Maya round 2** — asked what the stored output should look like (plain-English vs raw fields; patient records vs
+  relational) and what "queryable" means in practice. Answers: both are engineering calls, "document *why* in the
+  PLAN" (→ D10); for verification, "a CLI query, an HTTP endpoint returning JSON, or a manual SQL query — pick what's
+  natural, document it; the key is a clear, reproducible way to verify the data is in there and correct."
+  Decision: since ingest is already HTTP, add a read API keyed by message (→ D11), keep the SQL path too.
+- **Maya round 3** — ran the response contract past her (HTTP status = "did we accept the bytes", ACK = verdict).
+  She endorsed it for the take-home and named what she *doesn't* know: whether Woodbine's engine expects/reads a
+  standard HL7 ACK, whether they monitor AE/AR or just retry on non-2xx, whether they have ops monitoring, how they
+  handle concatenated payloads and duplicates on their side. All added to the README "assumptions to confirm" table
+  as questions for Daniel; she also flagged "is this the right pattern for all 4 providers" as a live-session topic.
+- Added `GET /messages/{id}`, `GET /messages/{id}/raw`, `GET /messages?controlId=&facility=&status=&limit=`;
+  8 more tests (61 total, green); re-ran the container demo and exercised the GETs by hand.
 
 ## Decision log
 
@@ -122,13 +134,29 @@ Format: what / why / what was rejected / what would change it.
   downstream concern and needs ADT). Timestamps → ISO-8601 with the precision sent and **no invented offset** (Maya:
   "almost certainly Eastern" is documented, not baked in). Column named `accession_number` (meaning) rather than
   `filler_order_number` (source) because the *mapping* is the provider-specific part and the table should be canonical.
+  Why normalized tables rather than a JSON blob (Maya: "both are defensible, say why"): the day-one questions are
+  relational — "reports for this patient", "everything from this provider", "rejections this week", "is this
+  accession already here" — and SQLite answers those with indexes, not JSON path scans; the raw bytes are stored
+  alongside so nothing the schema doesn't model is lost; and a fixed schema is what a second consumer (a UI, an
+  export) can build against. Rejected: JSON blob per message (fast to write, every query becomes application code);
+  a patient master table (needs identity resolution and ADT — the wrong place to invent it).
+- **D11 — Read API: `GET /messages/{id}` (+ `/raw`) and `GET /messages?controlId=&facility=&status=&limit=`.**
+  Maya: any reproducible verification path is fine (CLI, endpoint, SQL). Since ingest is already HTTP, the natural
+  demo is *send → get id back → GET it*, and the natural ops question is "what happened to MSG00042?" — so the API is
+  keyed by **our** id (what the POST returns in `X-Message-Id`/`Location`/JSON) *and* searchable by the **sender's**
+  control ID (only unique per facility, hence a list). `/raw` returns the exact stored bytes so a quarantined
+  message can be inspected without opening the DB. Message-centric on purpose: it answers "what did you send and
+  what did we do with it"; a report-centric API (`/reports?patientId=`) is the PocketHealth-side view and is listed
+  under "with more time". The `sqlite3` CLI path stays in the README because it's zero-code and shows the schema.
 
 ## Live-session prep notes (for me)
 
 Likely "extend it live" asks and where they land: MLLP listener (`Ingestion` is transport-agnostic; library has
 `MessageHelper.ExtractMessages`); a new provider with a quirk (`ProviderProfileRegistry` override); accept `ADT`
-(policy + a new extractor); read endpoint (`Dapper` query in `Http/`); auth (middleware); async worker (`messages`
-as queue); amendments (`OBX-11 = C`, `OBR-25`, latest-per-accession view).
+(policy + a new extractor); report-centric read endpoint (`MessageQueries` pattern → `ReportQueries`); auth
+(middleware); async worker (`messages` as queue); amendments (`OBX-11 = C`, `OBR-25`, latest-per-accession view);
+"is 200-for-rejects right for all four providers?" (D6 — per-provider response mapping would hang off
+`ProviderProfile`).
 
 ## AI usage
 
@@ -159,6 +187,9 @@ The substantive prompts, in order. Everything else was "run it / fix that / next
    HL7-V2; nHapi as heavyweight alternative), scaffold, Docker loop proven, first commit.
 4. Pasted the Maya's-assistant conversation. → Response contract flipped to 200-for-stored (D6); pipeline, schema,
    tests, demo scripts, README written and verified in Docker.
+5. Pasted Maya rounds 2–3 (data-model shape and "queryable" are our call; 200+ACK endorsed with open questions for
+   Daniel) and asked for an endpoint to fetch a sent message by a passed-in value. → Read API (D11) keyed by our id
+   and searchable by control ID, tests, docs.
 
 ## Dead ends / backed out
 
