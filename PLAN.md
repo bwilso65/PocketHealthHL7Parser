@@ -84,6 +84,11 @@ section says what was delegated and what wasn't. This file is one of the deliver
   + single INSERT in one transaction → ACK; statuses `queued → accepted | failed`, `rejected`/`duplicate` at receipt;
   `ack_code` column; NACK builder restored; validation exceptions at receipt → row `failed` + `AE` 207. Tests
   reworked (69 green, clean build); container demo re-run — ACKs and DB match the matrix.
+- Expanded README "What I'd do with more time" with the items I'd actually schedule first for a go-live: per-provider
+  API keys (generate/validate/revoke, bound to MSH-4 so a key can't send as another facility), signed responses so
+  the client can verify the ACK came from us, webhooks for async processing updates (outbox off the worker's status
+  transitions), and per-provider validation extensions (rule list on the profile — HL7 "standard" is not very
+  standardized). Grouped the list: trust/security → provider integration → operations → data.
 
 ## Decision log
 

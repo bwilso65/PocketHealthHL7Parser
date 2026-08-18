@@ -187,34 +187,73 @@ Maya's assistant could not answer these; the defaults below are documented in co
 | Timestamps are Eastern (Ontario) but sent without offset | stored as-is | Apply the offset at read time / add a per-provider TZ |
 | Only `ORU^R01`; ADT is out of scope | `ValidationPolicy.Default` | Add the type to `AcceptedMessageTypes` and an extractor |
 | Corrections/addenda arrive as new messages (new control ID); every version is kept | data model | Add a "current report per accession" view or an amendment status |
-| Sender identity is trusted from MSH-3/4 (no auth on the endpoint) | — | mTLS / API key / IP allowlist before any real PHI flows |
+| Sender identity is trusted from MSH-3/4 (no auth on the endpoint) | — | Per-provider API keys bound to MSH-4 (first item under "more time") before any real PHI flows |
 
 ## What I'd Do With More Time
 
-- **MLLP listener.** Most hospital engines speak MLLP/TCP, not HTTP. `IngestionService` is transport-agnostic and
-  the library already has MLLP frame extraction; a TCP listener that frames with `0x0B ... 0x1C 0x0D` and writes the
-  ACK back is a contained addition.
-- **Security for PHI.** TLS termination, mTLS or API keys per provider, IP allowlist, sender allowlist (reject
-  unknown MSH-4), request size limits, non-root container user, secrets management, audit of who read what.
-- **Operations.** Metrics (queued/accepted/rejected/duplicate/failed per provider, queue depth, processing
-  latency), alerting on rejection spikes and on `pending` growing, a replay path for quarantined/failed messages
-  (`POST /messages/{id}/replay` = re-validate and set status back to `queued`), structured JSON logs with correlation
-  IDs, OpenTelemetry.
-- **Amendments and report lifecycle.** Preliminary → final → corrected (OBX-11 `P`/`F`/`C`, OBR-25). Today every
-  message yields new report rows; add a "latest per (facility, accession)" view or an explicit supersedes link.
+Roughly in the order I'd do them for a real go-live.
+
+**Trust and security (this is PHI over HTTP)**
+
+- **API keys per provider — required on every request.** We generate a key per provider (`providers` table:
+  id, MSH-4 facility, hashed key, created/rotated/revoked-at), the client sends it in `Authorization: Bearer …`, and
+  a small auth middleware validates it (constant-time hash compare) and rejects missing/revoked keys with `401`
+  *before* the body is read. Two things fall out for free: the key **binds the request to a provider identity**, so a
+  message whose MSH-4 doesn't match the key's facility is rejected as spoofed instead of trusted (closing the
+  "sender identity is trusted from MSH-3/4" assumption above), and rotation/revocation is an `UPDATE`, no redeploy.
+  Plus the rest of the usual list: TLS termination, IP allowlist, request size limits, non-root container user,
+  secrets management, audit of who read what.
+- **Signed responses.** Add `X-Signature: ed25519=<base64>` and `X-Signature-Timestamp` over
+  `timestamp + "." + response body`, signed with our private key; publish the public key at a well-known endpoint so
+  a provider can verify the ACK (and any GET) came from us and wasn't altered in transit or replayed (timestamp
+  window + the ACK's own MSA-2/MSH-10 as a nonce). Asymmetric rather than HMAC so the verifier holds nothing that
+  can *forge* a signature. Symmetric HMAC with the provider's key would be the smaller first step.
+
+**Provider integration**
+
+- **Webhooks for processing updates.** Providers subscribe (`callback URL`, `secret`, event filter); we emit
+  `message.accepted` (reports written), `message.failed`, and later lifecycle events (amended, superseded) — the
+  synchronous ACK already covers `rejected`/`duplicate`, so the webhook is what tells them the *async* half
+  finished. Implementation is an outbox: the worker's status transitions insert into an `events` table in the same
+  transaction; a second background loop delivers them (POST, HMAC-signed with the subscription secret,
+  `Idempotency-Key = message id + event`, exponential backoff, dead-letter after N attempts, delivery log visible
+  at `GET /messages/{id}`). Same durability story as the message queue: nothing lives only in memory.
+- **Per-provider validation extensions.** HL7 "standard" isn't. `ValidationPolicy` today is a fixed set of
+  knobs; make it a list of rules — `IValidationRule { string Name; Rejection? Check(OruMessage, Message raw) }` —
+  with the current checks as the built-in set and per-provider additions registered on the `ProviderProfile`
+  (e.g. "Woodbine: OBR-32 principal result interpreter required", "provider X: OBX-2 must be TX or FT",
+  "provider Y: PID-3 must carry an OHIP repetition"). Rules run in order, first failure wins, each rule names itself
+  in the rejection so the sender sees *which* provider-specific rule bit. Simple predicates in code first; a small
+  declarative form (segment/field/regex/required) in configuration once there are three providers' worth of them.
+- **Provider profiles from configuration/DB** instead of code (fields, policy, rules, API key, webhook
+  subscriptions, encoding, timezone), with a small admin surface. Contract test suites per provider from real
+  de-identified samples.
+- **MLLP listener.** Most hospital engines speak MLLP/TCP, not HTTP. `MessageReceiver.Receive(bytes)` is
+  transport-agnostic and returns the ACK text; the library already has MLLP frame extraction; a TCP listener that
+  frames with `0x0B … 0x1C 0x0D` and writes the ACK back is a contained addition.
 - **Per-provider processing lanes.** One worker per sending facility (ordering preserved within a provider), so a
   burst from one provider can't delay report-writing for another. Receipt and the ACK are already isolated; this is
   about the time between `AA` and `accepted`.
+
+**Operations**
+
+- Metrics (queued/accepted/rejected/duplicate/failed per provider, queue depth, processing latency), alerting on
+  rejection spikes and on `pending` growing, a replay path for quarantined/failed messages
+  (`POST /messages/{id}/replay` = re-validate and set status back to `queued`), structured JSON logs with correlation
+  IDs, OpenTelemetry.
 - **Graceful drain on shutdown / a proper poison-message policy** — today an in-flight message is left `queued`
   and picked up on restart; a message that throws is marked `failed` after one attempt (no retries, no backoff).
+- **Schema migrations** (DbUp/EF migrations) once the schema starts changing under real data. Retention/purge
+  policy for raw payloads (PHI).
+
+**Data and reads**
+
+- **Amendments and report lifecycle.** Preliminary → final → corrected (OBX-11 `P`/`F`/`C`, OBR-25). Today every
+  message yields new report rows; add a "latest per (facility, accession)" view or an explicit supersedes link.
 - **Report-centric reads.** Today's API is message-centric (what was sent, what happened). Add
   `GET /reports?accession=…&patientId=…&facility=…` for the PocketHealth-side question ("this patient's reports"),
   with paging.
-- **Provider profiles from configuration/DB** instead of code, with per-provider validation policies and a small
-  admin surface. Contract test suites per provider from real de-identified samples.
 - **Embedded documents.** Radiology reports often arrive as base64 PDFs in an `ED` OBX; store them as blobs/files.
-- **Schema migrations** (DbUp/EF migrations) once the schema starts changing under real data. Retention/purge
-  policy for raw payloads (PHI).
 
 ## Notes for the Reviewer
 
