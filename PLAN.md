@@ -200,6 +200,12 @@ Format: what / why / what was rejected / what would change it.
   alongside so nothing the schema doesn't model is lost; and a fixed schema is what a second consumer (a UI, an
   export) can build against. Rejected: JSON blob per message (fast to write, every query becomes application code);
   a patient master table (needs identity resolution and ADT — the wrong place to invent it).
+  **IDs are auto-incrementing integers by choice, for this deliverable.** `messages.id`, `reports.id`,
+  `observations.id` and the links between them (`duplicate_of`, `message_id`, `report_id`) are small integers so the
+  relationships read at a glance in the DB and the API during the demo. Assumption made explicit: in a real
+  deployment, anything an endpoint exposes gets a generated, non-enumerable identifier (ULID/GUID) — sequential ids
+  on a public URL invite enumeration and leak volume, and don't survive merges or multiple writers; the integer stays
+  as the internal PK, the opaque id is what goes on the wire (README "more time", trust/security).
 - **D11 — Read API: `GET /messages/{id}` (+ `/raw`) and `GET /messages?controlId=&facility=&status=&limit=`.**
   Maya: any reproducible verification path is fine (CLI, endpoint, SQL). Since ingest is already HTTP, the natural
   demo is *send → get id back → GET it*, and the natural ops question is "what happened to MSG00042?" — so the API is
@@ -274,6 +280,9 @@ The substantive prompts, in order. Everything else was "run it / fix that / next
    Verified: `linux-musl-arm64` SQLite native present, no `.db` tracked, samples byte-identical after clone. Folded in
    my WAL→rollback-journal change and the PowerShell `show-db.ps1`. Then `git push origin main`; v0.1 release to
    follow, deliberately not tagged yet.
+10. Made one more assumption explicit: auto-incrementing integer IDs are a deliberate demo-readability choice; a
+    real deployment would expose generated non-enumerable ids on anything an endpoint returns. → README (decisions
+    + "more time" under trust/security), PLAN D10.
 
 ## Dead ends / backed out
 

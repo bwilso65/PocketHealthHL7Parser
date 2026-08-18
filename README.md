@@ -177,7 +177,13 @@ provider this week"), the raw bytes are kept alongside for anything the schema d
 `report_text` on `reports` serves the obvious read; timestamps stored as ISO-8601 with the precision sent and **no
 invented timezone**; PID demographics stored as a snapshot on the report (no patient master — identity matching is
 downstream's job); a read API keyed by **our** message id (what the POST hands back) *and* searchable by the
-**sender's** control ID (what Woodbine's ops would quote us) — because both conversations happen.
+**sender's** control ID (what Woodbine's ops would quote us) — because both conversations happen;
+**auto-incrementing integer IDs everywhere, on purpose for this deliverable** — `messages.id`, `reports.id`,
+`observations.id`, and the `duplicate_of` / `message_id` / `report_id` links between them are small integers so that
+the relationships are obvious when you're reading the DB or the API in the demo (`duplicate_of = 2` says more than a
+GUID). In a real deployment anything exposed on an endpoint would carry a generated, non-enumerable identifier
+(ULID/GUID) instead: sequential ids on a public URL invite enumeration and leak volume, and they don't survive
+merges or multi-node writers. The integer stays as the internal primary key; the opaque id is what goes on the wire.
 
 ## Assumptions to confirm with Woodbine before go-live
 
@@ -217,6 +223,11 @@ Roughly in the order I'd do them for a real go-live.
   a provider can verify the ACK (and any GET) came from us and wasn't altered in transit or replayed (timestamp
   window + the ACK's own MSA-2/MSH-10 as a nonce). Asymmetric rather than HMAC so the verifier holds nothing that
   can *forge* a signature. Symmetric HMAC with the provider's key would be the smaller first step.
+- **Opaque public identifiers.** Keep the integer primary keys internally, but add a generated, non-enumerable id
+  (ULID — sortable, so "newest first" still works — or GUID) to `messages` and `reports`, and use *that* in
+  `X-Message-Id`, `Location`, `GET /messages/{id}`, and webhook payloads. Sequential ids on a public URL let a
+  caller walk `/messages/1..N` and read the volume off the counter; with API keys scoping each caller to its own
+  provider the damage is bounded, but the ids still shouldn't be guessable.
 
 **Provider integration**
 
