@@ -1,0 +1,13 @@
+# Keep line endings deterministic across Windows/macOS/Linux checkouts.
+* text=auto eol=lf
+
+# HL7 sample messages use \r as the segment terminator (some end \r\n, one ends \n) — those bytes ARE the test.
+# Never let git touch them.
+*.hl7 -text
+
+# Shell scripts and the Dockerfile must be LF to run inside Linux containers / Git Bash.
+*.sh       text eol=lf
+Dockerfile text eol=lf
+
+# PowerShell is happy either way; keep the Windows convention.
+*.ps1      text eol=crlf
