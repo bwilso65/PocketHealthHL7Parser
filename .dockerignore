@@ -1,0 +1,11 @@
+.git
+.gitignore
+**/bin/
+**/obj/
+data/
+*.db
+*.db-wal
+*.db-shm
+.vs/
+.idea/
+.vscode/

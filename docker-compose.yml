@@ -1,0 +1,22 @@
+services:
+  hl7-server:
+    build:
+      context: .
+      target: runtime
+    container_name: hl7-server
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - DB_PATH=/app/data/messages.db
+      - PORT=8080
+    restart: unless-stopped
+
+  # Test runner. Not started by `docker compose up`; run explicitly with:
+  #   docker compose --profile test run --rm tests
+  tests:
+    build:
+      context: .
+      target: test
+    profiles: ["test"]
