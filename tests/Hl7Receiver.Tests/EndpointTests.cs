@@ -114,6 +114,31 @@ public class EndpointTests
     }
 
     [Fact]
+    public async Task Utf8_BOM_and_leading_blank_lines_are_transport_noise_not_content()
+    {
+        // e.g. a message saved by a Windows editor and posted with a leading newline
+        using var server = new TestServer();
+        var body = new byte[] { 0xEF, 0xBB, 0xBF }.Concat(Encoding.UTF8.GetBytes("\r\n  " + ValidOru)).ToArray();
+        var result = await server.Post(body);
+
+        Assert.Equal("AA", result.AckCode);
+        Assert.Equal("accepted", result.Status);
+        Assert.Equal(body, (byte[])server.Message(result.MessageId)!.raw_message);   // stored exactly as sent
+    }
+
+    [Fact]
+    public async Task Utf16_with_BOM_is_decoded()
+    {
+        // Windows PowerShell 5.1's `>` / Out-File default is UTF-16LE with a BOM
+        using var server = new TestServer();
+        var body = Encoding.Unicode.GetPreamble().Concat(Encoding.Unicode.GetBytes(ValidOru.Replace("DOE^JANE", "CÔTÉ^RENÉ"))).ToArray();
+        var result = await server.Post(body);
+
+        Assert.Equal("accepted", result.Status);
+        Assert.Equal("CÔTÉ", server.Scalar<string>("SELECT patient_family_name FROM reports"));
+    }
+
+    [Fact]
     public async Task Escape_sequences_and_formatted_text_line_breaks_are_decoded()
     {
         using var server = new TestServer();

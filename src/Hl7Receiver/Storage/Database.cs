@@ -47,12 +47,17 @@ public sealed class Database
 
     /// <summary>
     /// Creates the schema if it does not exist. Idempotent; safe to run on every startup.
-    /// WAL mode lets the DB be read (e.g. via the sqlite3 CLI) while the server is writing.
+    /// Rollback journal, not WAL: WAL's -shm file is memory-mapped and shared across processes, which
+    /// isn't reliable over a Docker Desktop bind mount from a Windows host — a second process (e.g. the
+    /// sqlite3 CLI via `docker compose exec`) can fail to open the DB, or see a stale/empty snapshot,
+    /// while the server keeps running. DELETE mode has no cross-process shared memory, so external reads
+    /// are consistent at any point, not just right after a restart. We're single-writer already (one
+    /// background worker), so WAL's concurrent-writer benefit was never in play.
     /// </summary>
     public void Initialize()
     {
         using var connection = Open();
-        connection.Execute("PRAGMA journal_mode=WAL;");
+        connection.Execute("PRAGMA journal_mode=DELETE;");
         connection.Execute("PRAGMA foreign_keys=ON;");
         connection.Execute(Schema.Sql);
     }

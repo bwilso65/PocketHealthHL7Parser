@@ -16,3 +16,6 @@ obj/
 *.suo
 .vs/
 TestResults/
+*.db-wal
+*.db-shm
+*.db-journal

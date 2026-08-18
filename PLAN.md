@@ -72,7 +72,7 @@ section says what was delegated and what wasn't. This file is one of the deliver
   the `messages` table), `ProcessingWorker` (`BackgroundService`: startup sweep, signal-driven drain, 30 s safety
   sweep, `failed` on exception), `MessageProcessor` (the pipeline, unchanged logic), `messages.processed_at`, statuses
   `received`/`failed`, `/healthz` with queue depth, verdict writes guarded by `status='received'`. Removed the NACK
-  builder and the AE/AR classification (dead under async; in git history at `d2a41b1`). Tests updated to await the
+  builder and the AE/AR classification (dead under async; in git history at `96b7aa7`). Tests updated to await the
   verdict; 6 new async tests (receipt-before-verdict, restart recovery from `received`, 40-message burst + FIFO,
   direct drain, queue depth). 67 green, run twice for flakiness. Demo scripts now show the ACK *and* the verdict.
 - **Reversed the always-`AA` part.** On review: answering `AA` to a message we then reject is a lie to the sender,
@@ -89,6 +89,17 @@ section says what was delegated and what wasn't. This file is one of the deliver
   the client can verify the ACK came from us, webhooks for async processing updates (outbox off the worker's status
   transitions), and per-provider validation extensions (rule list on the profile — HL7 "standard" is not very
   standardized). Grouped the list: trust/security → provider integration → operations → data.
+- **Pre-submission audit** ("is anything missing that would stop this being accepted?"). Checked the brief line by
+  line and, more usefully, how a reviewer on another OS actually runs it. Found and fixed: `scripts/*.sh` were
+  committed `100644` (Windows git doesn't record the exec bit — `Permission denied` on a Mac/Linux clone; fixed
+  with `git update-index --chmod=+x`); SQLite sidecar files not gitignored; a UTF-8/UTF-16 BOM or a leading blank
+  line before `MSH` (Windows PowerShell 5.1 writes UTF-16LE+BOM by default) turned a valid hand-made test message
+  into `AR` "MSH not found" — now treated as transport noise, raw bytes still stored as sent (2 tests). Verified:
+  `linux-musl-arm64` SQLite native lib is bundled (Apple Silicon reviewers), no `.db` tracked, README's test count
+  and script names match, `docker compose up --build` from a clean tree. Switched the SQLite journal from WAL to the
+  default rollback journal after seeing `docker compose exec … sqlite3` misbehave over a Windows bind mount (D4).
+  Added README notes: use `--data-binary` (curl `-d` strips the segment terminators), sample-04 order dependence,
+  how to reset the DB. 71 tests, run twice.
 
 ## Decision log
 
@@ -116,9 +127,13 @@ Format: what / why / what was rejected / what would change it.
   we map that to `\n` in the extractor. We build the ACK by hand (20 lines) rather than with the library so the same
   code path works for unparseable input.
 - **D4 — Storage: `Microsoft.Data.Sqlite` + Dapper, hand-written SQL, `CREATE ... IF NOT EXISTS` on startup.** Small,
-  transparent, and easy to extend live. WAL mode so the DB can be inspected while the server writes. Rejected: EF Core
-  (migrations + model ceremony for ~3 tables); a bare `SqliteCommand` everywhere (Dapper removes boilerplate without
-  hiding SQL). Would change if: the schema starts evolving in production — then a real migration tool.
+  transparent, and easy to extend live. Rollback journal (`DELETE`), not WAL: WAL's `-shm` file is memory-mapped and
+  shared across processes, which isn't reliable over a Docker Desktop bind mount from a Windows host — a second
+  process (e.g. the `sqlite3` CLI via `docker compose exec`) could fail to open the DB, or see a stale snapshot,
+  while the server kept running; harmless in a single-writer design like this one, where WAL's actual benefit
+  (concurrent writers) was never in play. Rejected: EF Core (migrations + model ceremony for ~3 tables); a bare
+  `SqliteCommand` everywhere (Dapper removes boilerplate without hiding SQL). Would change if: the schema starts
+  evolving in production — then a real migration tool.
 - **D5 — Behaviour matrix for the samples.** Underlying principle: **every payload is stored raw with a status**
   (`accepted` / `duplicate` / `rejected` + reason), so rejecting is never data loss — it's quarantine with replay.
   Idempotency key = (sending facility, sending app, control ID), not control ID alone (two providers can both send
@@ -139,8 +154,8 @@ Format: what / why / what was rejected / what would change it.
   itself makes between commit-level and application-level acknowledgement. Confirmed on review. Rejected: `400/422`
   for rejections (better REST hygiene, wrong for a retrying sender).
 - **D7 — Validate synchronously; write reports asynchronously.** This went through three versions, and the arc is
-  the point. (v1, `d2a41b1`) everything synchronous: honest ACK, simple, but receipt coupled to processing.
-  (v2, `322b753`) on review I asked for async processing — cleaner receiver ("we have the file or we don't"), bursts
+  the point. (v1, `96b7aa7`) everything synchronous: honest ACK, simple, but receipt coupled to processing.
+  (v2, `b997a39`) on review I asked for async processing — cleaner receiver ("we have the file or we don't"), bursts
   absorbed by a queue, one provider's burst can't slow another's receipt — and it was built as *store raw + `AA` for
   everything, verdict later*. The AI flagged the consequence ("the sender never learns about a rejection through the
   ACK") as a documented trade-off and built it. That was the wrong call, and on review I said so: an `AA` we later
@@ -259,7 +274,7 @@ The substantive prompts, in order. Everything else was "run it / fix that / next
   storm; replaced with `200 + AE/AR` and made rejections loud elsewhere (D6).
 - Tried mapping a nullable value tuple from Dapper for the duplicate check; swapped for a tiny mapping class rather
   than find out how Dapper feels about `Nullable<ValueTuple>` at demo time.
-- **The always-`AA` async version (`322b753`).** Built for a day, then reversed. Correct instinct (decouple receipt
+- **The always-`AA` async version (`b997a39`).** Built for a day, then reversed. Correct instinct (decouple receipt
   from processing), wrong cut (moved the *verdict* out of the request too, so the ACK stopped being true). Kept the
   worker, the queue-in-the-table, the restart sweep and the guarded transitions; put validation and the NACK builder
   back in the request. Lesson recorded in D7 and in "AI usage": when a directive has a consequence like "the sender

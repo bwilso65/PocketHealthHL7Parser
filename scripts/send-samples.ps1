@@ -37,4 +37,4 @@ foreach ($id in $ids) {
     Write-Host $line
 }
 Write-Host ""
-Write-Host "Details: curl $BaseUrl/messages/<id>    quarantine: curl '$BaseUrl/messages?status=rejected'    DB: scripts/show-db.sh"
+Write-Host "Details: curl $BaseUrl/messages/<id>    quarantine: curl '$BaseUrl/messages?status=rejected'    DB: scripts/show-db.ps1"

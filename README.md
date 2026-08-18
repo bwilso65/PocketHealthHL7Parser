@@ -14,12 +14,12 @@ Microsoft.Data.Sqlite + Dapper · xUnit. See [PLAN.md](PLAN.md) for the plan/pro
 docker compose up --build
 ```
 
-The server listens on `http://localhost:8080`. The database is `./data/messages.db` (bind-mounted, WAL mode).
+The server listens on `http://localhost:8080`. The database is `./data/messages.db` (bind-mounted).
 
 ## Test
 
 ```bash
-# Unit + integration tests (69), inside Docker
+# Unit + integration tests (71), inside Docker
 docker compose --profile test run --rm tests
 
 # Post every sample message: prints the ACK for each, then each message's verdict from GET /messages/{id}
@@ -27,10 +27,12 @@ scripts/send-samples.sh            # or: scripts/send-samples.ps1
 scripts/send-samples.sh --json     # JSON receipts instead of HL7 ACKs
 
 # See what landed (uses the sqlite3 CLI inside the container)
-scripts/show-db.sh
+scripts/show-db.sh             # or: scripts/show-db.ps1
 ```
 
-Or by hand — send one, then look it up (the `X-Message-Id` / `Location` header on the POST tells you where):
+Or by hand — send one, then look it up (the `X-Message-Id` / `Location` header on the POST tells you where).
+Use `--data-binary`, not `-d`/`--data`: curl's `-d` strips the `\r`/`\n` segment terminators from a file, which turns
+the message into one long segment.
 
 ```bash
 curl -i -X POST http://localhost:8080/messages -H "Content-Type: text/plain" --data-binary @samples/02_oru_valid_01.hl7
@@ -49,6 +51,9 @@ docker compose exec hl7-server sqlite3 -header -column /app/data/messages.db \
 docker compose exec hl7-server sqlite3 -header -column /app/data/messages.db \
   "SELECT accession_number, patient_identifier, patient_family_name, procedure_description, report_text FROM reports;"
 ```
+
+The database persists across restarts (it's a bind mount), so a second run of the samples will report the valid
+ones as duplicates — that's the idempotency working. To start over: stop the stack and delete `data/messages.db`.
 
 ## What it does
 
@@ -98,7 +103,7 @@ Every one of these gets HTTP `200` (the bytes were stored). The ACK carries the 
 | Sample | ACK | `messages.status` | Why |
 |---|---|---|---|
 | 01 minimal, 02 full, 03 other sender | AA | queued → accepted | 03 shows the sender is data (MSH-4), not a hard-coded "WOODBINE" |
-| 04 same control ID as 02, different body | AA + "Duplicate…" | duplicate → points at #2 | Idempotent: the retry succeeds so the sender stops; the stored report is untouched; the body-hash mismatch is recorded in `detail` and logged as a warning |
+| 04 same control ID as 02, different body | AA + "Duplicate…" | duplicate → points at #2 | Idempotent: the retry succeeds so the sender stops; the stored report is untouched; the body-hash mismatch is recorded in `detail` and logged as a warning. (The rule is "first live message with that key wins" — post 04 before 02 and it's 02 that becomes the duplicate) |
 | 05 broken MSH | AR + `ERR` 100 | rejected `UNPARSEABLE` | Can't parse; sender/facility still sniffed from the partial MSH; raw kept |
 | 06 two messages in one payload | AR + `ERR` 100 | rejected `MULTIPLE_MSH` | One request = one message = one ACK. Splitting would hide the sender's bug; taking only the first would silently drop a report. Raw kept, replayable |
 | 07 truncated mid-OBX | AE + `ERR` 101 | rejected `REQUIRED_FIELD_MISSING` (OBX-11) | Result status is HL7-required and is the truncation tell. A partial radiology report stored as complete is a patient-safety problem |
@@ -107,9 +112,10 @@ Every one of these gets HTTP `200` (the bytes were stored). The ACK carries the 
 `AE` vs `AR` follows HL7's intent: AR = "can't/won't process this kind of thing" (syntax, type, structure),
 AE = "understood it, content isn't acceptable" (missing required field). The `ERR` segment carries a table-0357 code.
 
-Leniency we chose: `\r`, `\n`, `\r\n` segment terminators; any HL7 2.x version; unknown segments (ORC, NTE, PV1,
-Z-segments) ignored; multiple OBR per message supported; repeated PID-3 uses the first repetition; `\.br\`, `\F\`
-etc. decoded; charset from MSH-18, else strict UTF-8, else ISO-8859-1 fallback (never silently corrupts accents).
+Leniency we chose: `\r`, `\n`, `\r\n` segment terminators; a UTF-8/UTF-16 byte-order mark or blank lines before
+`MSH` ignored (Windows tooling adds them); any HL7 2.x version; unknown segments (ORC, NTE, PV1, Z-segments) ignored;
+multiple OBR per message supported; repeated PID-3 uses the first repetition; `\.br\`, `\F\` etc. decoded; charset
+from the BOM, else MSH-18, else strict UTF-8, else ISO-8859-1 fallback (never silently corrupts accents).
 
 ## Decisions and Tradeoffs
 
@@ -123,7 +129,7 @@ the part that isn't needed for the verdict and is where heavier work will accumu
 `observations` (later: patient matching, embedded documents, notifications). So the sender gets `AE`/`AR` + `ERR`
 for a bad message immediately and can error-queue it on their side, `AA` for a good one, and the reports appear
 milliseconds later. History, because it's the honest story: the first version did everything synchronously
-(`d2a41b1`); the second moved *all* processing behind the queue and ACKed `AA` on receipt for everything (`322b753`)
+(`96b7aa7`); the second moved *all* processing behind the queue and ACKed `AA` on receipt for everything (`b997a39`)
 — simpler receiver, burst-proof, and **wrong**, because it told the sender "accepted" for messages we later rejected
 and left rejections invisible to them; this version keeps the async seam where it earns its keep and puts the
 verdict back where the sender can see it. Rejected: `AA`-for-everything (above); honest REST (`400/422` for content
@@ -161,8 +167,11 @@ faithful HAPI port with generated per-version models; strict and heavy for a rec
 to tolerate quirks. Rejected: hand-rolled parser — fine for these eight files, grows fast (repetitions,
 sub-components, escapes, Z-segments), and every bug is ours.
 
-Smaller calls: SQLite in WAL mode with
-`CREATE IF NOT EXISTS` at startup (no migration tool yet); **normalized tables, not a JSON blob** — `messages` /
+Smaller calls: SQLite with the default rollback journal (not WAL — WAL's shared-memory index isn't reliable across
+processes over a Docker Desktop bind mount from a Windows host, so a second process like the `sqlite3` CLI could
+fail to open the DB, or see a stale snapshot, while the server kept running; we're single-writer anyway, so WAL's
+concurrent-writer benefit was never in play) and `CREATE IF NOT EXISTS` at startup (no migration tool yet);
+**normalized tables, not a JSON blob** — `messages` /
 `reports` / `observations` are what you'd query on day one ("reports for this patient", "rejections from this
 provider this week"), the raw bytes are kept alongside for anything the schema doesn't capture, and a denormalized
 `report_text` on `reports` serves the obvious read; timestamps stored as ISO-8601 with the precision sent and **no

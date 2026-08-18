@@ -3,6 +3,10 @@
 # Usage: scripts/show-db.sh
 set -euo pipefail
 
+# On Windows Git Bash, MSYS rewrites args that look like absolute POSIX paths (e.g. /app/data/messages.db)
+# into Windows paths before docker ever sees them. Harmless no-op outside MSYS (e.g. Linux/macOS).
+export MSYS_NO_PATHCONV=1
+
 q() {
   docker compose exec -T hl7-server sqlite3 -header -column /app/data/messages.db "$1"
 }
