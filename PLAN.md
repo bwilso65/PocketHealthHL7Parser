@@ -75,6 +75,15 @@ section says what was delegated and what wasn't. This file is one of the deliver
   builder and the AE/AR classification (dead under async; in git history at `d2a41b1`). Tests updated to await the
   verdict; 6 new async tests (receipt-before-verdict, restart recovery from `received`, 40-message burst + FIFO,
   direct drain, queue depth). 67 green, run twice for flakiness. Demo scripts now show the ACK *and* the verdict.
+- **Reversed the always-`AA` part.** On review: answering `AA` to a message we then reject is a lie to the sender,
+  and it makes our rejections invisible to their engine. The AI had flagged that as "the trade-off" and built it
+  anyway; it should have pushed back with the alternative up front. The alternative is the obvious hybrid: keep the
+  quick validation *in the request* so the ACK is honest (`AA`/`AE`/`AR` + `ERR`), keep the raw bytes landing in
+  `messages` immediately, and move only the report-writing (and future heavier work) to the async worker.
+- Implemented the hybrid: `MessageEvaluator` (the pure pipeline, shared), `MessageReceiver` = evaluate → dup check
+  + single INSERT in one transaction → ACK; statuses `queued → accepted | failed`, `rejected`/`duplicate` at receipt;
+  `ack_code` column; NACK builder restored; validation exceptions at receipt → row `failed` + `AE` 207. Tests
+  reworked (69 green, clean build); container demo re-run — ACKs and DB match the matrix.
 
 ## Decision log
 
@@ -117,35 +126,37 @@ Format: what / why / what was rejected / what would change it.
   | 06 | two messages in one payload | reject whole payload `MULTIPLE_MSH` (AR) | one POST = one message; can't return one honest ACK for two control IDs; splitting hides a sender bug; taking only the first silently loses a report. Raw kept. |
   | 07 | truncated in OBX-5 | reject `REQUIRED_FIELD_MISSING` OBX-11 (AE) | OBX-11 (result status, HL7-required) missing → treat as incomplete. A partial radiology report stored as complete is a patient-safety issue |
   | 08 | ADT^A01 | reject `UNSUPPORTED_MESSAGE_TYPE` (AR) | not a report; HL7 table 0357 code 200 |
-  (The AE/AR column reflects the first, synchronous version, where the ACK carried the verdict with an `ERR`
-  segment: AR = "can't/won't process this kind of thing", AE = "understood it, content isn't acceptable". Under D7
-  the ACK is a receipt only; the same verdicts and codes live in the DB / API / logs.)
-- **D6 — HTTP status = "do we reliably have your bytes". `200` for anything durably stored, regardless of content.**
-  First cut after Maya's "their sender will retry on non-2xx": a permanently-bad message answered with `4xx` would be
-  retried forever, so `200` = stored, `400` = nothing to store (empty body), `5xx` = couldn't persist (the one case
-  where a retry is right). Initially the ACK body carried the application verdict (`AA`/`AE`/`AR` + `ERR`)
-  synchronously. **Confirmed on review, and tightened**: the HTTP layer's meaning is *only* receipt, and the
-  verdict moved out of the request entirely (D7). Rejected: `400/422` for rejections (better REST hygiene, wrong for
-  a retrying sender).
-- **D7 — Asynchronous processing: receive → store raw + `AA` "Received" → background worker reaches the verdict.**
-  *Changed on review* from synchronous. Why: (1) the receiving logic becomes trivial and hard to break — an INSERT
-  and an ACK, nothing that can throw on bad content; (2) bursts (Maya: their queue backs up) are absorbed by the
-  queue instead of holding request threads, and one provider's burst can't slow *receipt* for another; (3) the same
-  ordering guarantees as before (single FIFO worker, per-sender order preserved). What it trades away, stated so it
-  can be defended: the sender never sees `AE`/`AR` — a bad message becomes our operational problem (quarantine, GET
-  API, logs, and with more time alerting), not something their engine error-queues; and processing latency (not
-  receipt) for provider B still sits behind provider A's burst with a single worker — per-facility lanes are the
-  next step. ACK code: `AA`, not HL7's exact `CA` (commit accept), because `CA` only exists in enhanced-ack mode
-  (MSH-15 set) and Woodbine's messages are original mode where the sender expects `AA`; immediate-`AA`-then-process
-  is also what interface engines (e.g. Mirth's "auto-generate before processing") do by default. Design: the
-  `messages` table *is* the durable queue (`status = received`); an in-process bounded channel is only a wake-up, so
-  a burst of signals collapses to one; the worker sweeps on startup (crash recovery), on signal, and every 30 s;
-  a processing exception marks the row `failed` (kept, replayable) and the worker moves on; verdict `UPDATE`s are
-  guarded by `status = 'received'` so a verdict is written exactly once even if two drainers race. Rejected: an
-  external broker (nothing to gain below SQLite's ceiling; another thing to run in `docker compose`); N parallel
-  workers (SQLite is single-writer, and ordering would need care); per-facility lanes now (YAGNI with one provider,
-  documented as the next step). Would change if: a provider's engine needs the verdict in the ACK — a per-provider
-  "sync verdict" option off `ProviderProfile` (the sync pipeline is at `d2a41b1`).
+  AE vs AR follows HL7's intent: AR = "can't/won't process this kind of thing" (syntax, type, structure), AE = "understood it, content isn't acceptable" (missing required field). Both come back with an `ERR` segment carrying a table-0357 code.
+- **D6 — HTTP status = "do we reliably have your bytes"; the ACK = the verdict. `200` for anything durably stored,
+  regardless of content.** After Maya's "their sender will retry on non-2xx": a permanently-bad message answered with
+  `4xx` would be retried forever, so `200` = stored, `400` = nothing to store (empty body), `5xx` = couldn't persist
+  (the one case where a retry is right); the application verdict travels in `MSA-1` + `ERR`, the same split HL7
+  itself makes between commit-level and application-level acknowledgement. Confirmed on review. Rejected: `400/422`
+  for rejections (better REST hygiene, wrong for a retrying sender).
+- **D7 — Validate synchronously; write reports asynchronously.** This went through three versions, and the arc is
+  the point. (v1, `d2a41b1`) everything synchronous: honest ACK, simple, but receipt coupled to processing.
+  (v2, `322b753`) on review I asked for async processing — cleaner receiver ("we have the file or we don't"), bursts
+  absorbed by a queue, one provider's burst can't slow another's receipt — and it was built as *store raw + `AA` for
+  everything, verdict later*. The AI flagged the consequence ("the sender never learns about a rejection through the
+  ACK") as a documented trade-off and built it. That was the wrong call, and on review I said so: an `AA` we later
+  contradict is a lie, and rejections become invisible to the sender's engine. (v3, this) the hybrid I should have
+  been offered up front: the *quick validation* (parse → envelope → extract → required fields → duplicate check;
+  pure in-memory, ~1 ms) runs in the request so the ACK is honest — `AA` queued / duplicate, `AE`/`AR` + `ERR`
+  rejected — the raw bytes land in `messages` in one write *with* the verdict before the ACK leaves, and only the
+  report-writing (and future heavier work: patient matching, embedded PDFs, notifications) happens in the worker.
+  Receipt is still isolated per provider and still cheap; the queue still absorbs bursts of DB writes; and the
+  sender is told the truth. Design details: `MessageEvaluator` is the shared pure pipeline (receiver and worker both
+  run it — the worker re-extracts from the stored bytes, so nothing has to survive in memory and a restart changes
+  nothing); dup check + INSERT share one `BEGIN IMMEDIATE` transaction (concurrent retries can't both be queued;
+  partial unique index over live rows as backstop); `queued → accepted|failed` `UPDATE` guarded by `status='queued'`;
+  the worker sweeps on startup / on signal / every 30 s; a validation exception at receipt (our bug) stores the row
+  `failed` and answers `AE` 207 — a retry wouldn't help; a worker exception marks `failed`, replayable. Rejected:
+  `AA`-for-everything (v2 — above); `CA` instead of `AA` (only exists in enhanced-ack mode; Woodbine is original
+  mode); an external broker (nothing to gain below SQLite's ceiling); N parallel workers (SQLite is single-writer,
+  ordering would need care); per-facility lanes now (YAGNI with one provider — documented next step; note the
+  remaining limit is only the time between `AA` and `accepted`, not receipt or the ACK); storing before validating
+  (two writes for nothing — no ACK leaves before the row commits, so a crash mid-request just means the sender
+  retries).
 - **D8 — Provider flexibility: a `ProviderProfile` (validation policy + field mapping) resolved by MSH-4, default for
   everyone today.** Answering Maya's "rigid pipeline vs hooks for quirks": the pipeline is fixed
   (decode → parse → validate → extract → persist → ACK) and the *knobs* are data — which message types, which fields
@@ -180,13 +191,13 @@ Format: what / why / what was rejected / what would change it.
 
 ## Live-session prep notes (for me)
 
-Likely "extend it live" asks and where they land: MLLP listener (`MessageReceiver` is transport-agnostic; library
-has `MessageHelper.ExtractMessages`); a new provider with a quirk (`ProviderProfileRegistry` override); accept `ADT`
-(policy + a new extractor); report-centric read endpoint (`MessageQueries` pattern → `ReportQueries`); auth
-(middleware); replay endpoint (`UPDATE messages SET status='received'` + `ProcessingQueue.Signal()`); per-facility
-worker lanes (`ProcessingWorker` → one drain loop per MSH-4); amendments (`OBX-11 = C`, `OBR-25`,
-latest-per-accession view); "should the verdict be in the ACK for provider X?" (D7 — a per-provider sync option off
-`ProviderProfile`, sync pipeline at `d2a41b1`); retries/backoff for `failed`.
+Likely "extend it live" asks and where they land: MLLP listener (`MessageReceiver.Receive(bytes)` is
+transport-agnostic and returns the ACK text; library has `MessageHelper.ExtractMessages` for framing); a new provider
+with a quirk (`ProviderProfileRegistry` override); accept `ADT` (policy + a new extractor); report-centric read
+endpoint (`MessageQueries` pattern → `ReportQueries`); auth (middleware); replay endpoint (re-run
+`MessageEvaluator`, `UPDATE messages SET status='queued'` + `ProcessingQueue.Signal()`); per-facility worker lanes
+(`ProcessingWorker` → one drain loop per MSH-4); amendments (`OBX-11 = C`, `OBR-25`, latest-per-accession view);
+retries/backoff for `failed`; enhanced-mode `CA` acks if a provider sets MSH-15.
 
 ## AI usage
 
@@ -201,6 +212,10 @@ latest-per-accession view); "should the verdict be in the ACK for provider X?" (
   the answers back (which flipped D6); reviewed the code as it landed.
 - What I deliberately did *not* delegate: the strict-vs-lenient policy per sample and the HTTP/ACK contract. The AI
   proposed a matrix; each row is a call I have to be able to defend, and D6 in particular changed after talking to Maya.
+- Where the AI got it wrong and I caught it: D7 v2. I asked for async processing; it noted that the ACK would stop
+  reflecting validity and built it anyway. It should have led with the hybrid (validate in the request, defer the
+  writes). I reversed it on review. That's the working relationship I want with these tools: they build fast, I own
+  the contract with the provider.
 - Dead ends the AI helped avoid: it found `HL7-dotnetcore` was deprecated before we depended on it; it read the
   library's `Encode`/`Decode` to confirm escaped text round-trips before we relied on that; it caught the `<BR>` quirk.
 
@@ -221,9 +236,13 @@ The substantive prompts, in order. Everything else was "run it / fix that / next
    Daniel) and asked for an endpoint to fetch a sent message by a passed-in value. → Read API (D11) keyed by our id
    and searchable by control ID, tests, docs.
 6. Reviewed and confirmed the HTTP contract (200 = we reliably have the data; 400 empty; 5xx trouble) and directed
-   the change to asynchronous processing — cleaner receiver, burst isolation between providers. → The AI pushed
-   back on two consequences first (sender loses AE/AR visibility; single worker isolates receipt but not
-   processing latency), then rebuilt receiver/worker/processor, tests, scripts, docs (D6/D7 rewritten).
+   the change to asynchronous processing — cleaner receiver, burst isolation between providers. → The AI noted two
+   consequences (sender loses AE/AR visibility; single worker isolates receipt but not processing latency), then
+   built it as "AA for everything, verdict later".
+7. Rejected always-`AA` ("why didn't you push back on this one?") and asked for the hybrid: quick validation parse in
+   the receiver with proper ACKs for invalid/unparseable/corrupt messages; raw bytes into `messages` fast; only the
+   `reports` population async. → The AI owned the miss, then rebuilt: shared `MessageEvaluator`, sync validate +
+   store + honest ACK, worker writes reports; D7 rewritten with the full arc.
 
 ## Dead ends / backed out
 
@@ -235,8 +254,10 @@ The substantive prompts, in order. Everything else was "run it / fix that / next
   storm; replaced with `200 + AE/AR` and made rejections loud elsewhere (D6).
 - Tried mapping a nullable value tuple from Dapper for the duplicate check; swapped for a tiny mapping class rather
   than find out how Dapper feels about `Nullable<ValueTuple>` at demo time.
-- The first version validated synchronously and put `AE`/`AR` + an `ERR` segment in the ACK. Kept the verdict
-  vocabulary, dropped the NACK builder when processing went async (D7) — dead code is worse than a git tag. It's at
-  `d2a41b1` if a provider ever needs the verdict on the wire.
+- **The always-`AA` async version (`322b753`).** Built for a day, then reversed. Correct instinct (decouple receipt
+  from processing), wrong cut (moved the *verdict* out of the request too, so the ACK stopped being true). Kept the
+  worker, the queue-in-the-table, the restart sweep and the guarded transitions; put validation and the NACK builder
+  back in the request. Lesson recorded in D7 and in "AI usage": when a directive has a consequence like "the sender
+  is told AA for a message we'll reject", propose the alternative *before* building, not in the trade-offs section.
 - First cut of the worker's wake-up used `WaitToReadAsync` raced against `Task.Delay`; that leaves a dangling reader
   on timeout. Replaced with a linked `CancellationTokenSource` timeout.

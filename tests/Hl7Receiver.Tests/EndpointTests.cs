@@ -33,12 +33,28 @@ public class EndpointTests
         Assert.Equal(200, result.StatusCode);
         using var json = JsonDocument.Parse(result.Body);
         var root = json.RootElement;
-        Assert.Equal("received", root.GetProperty("status").GetString());
+        Assert.Equal("queued", root.GetProperty("status").GetString());   // valid → queued for the worker
         Assert.Equal("AA", root.GetProperty("ackCode").GetString());
         Assert.Equal("CTRL-1", root.GetProperty("messageControlId").GetString());
         Assert.Equal("WOODBINE", root.GetProperty("sender").GetProperty("facility").GetString());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("rejection").ValueKind);
         Assert.Equal(result.MessageId, root.GetProperty("messageId").GetInt64().ToString());
         Assert.Equal($"/messages/{result.MessageId}", root.GetProperty("href").GetString());
+    }
+
+    [Fact]
+    public async Task Json_receipt_for_a_rejected_message_carries_the_reason()
+    {
+        using var server = new TestServer();
+        var result = await server.PostSample("08_adt_wrong_type.hl7", accept: "application/json");
+
+        Assert.Equal(200, result.StatusCode);
+        using var json = JsonDocument.Parse(result.Body);
+        var root = json.RootElement;
+        Assert.Equal("rejected", root.GetProperty("status").GetString());
+        Assert.Equal("AR", root.GetProperty("ackCode").GetString());
+        Assert.Equal("UNSUPPORTED_MESSAGE_TYPE", root.GetProperty("rejection").GetProperty("code").GetString());
+        Assert.Equal("200", root.GetProperty("rejection").GetProperty("hl7ErrorCode").GetString());
     }
 
     [Fact]
@@ -48,7 +64,7 @@ public class EndpointTests
         var result = await server.PostText(ValidOru);
 
         var segments = result.Body.TrimEnd('\r').Split('\r');
-        Assert.Equal(2, segments.Length); // MSH + MSA
+        Assert.Equal(2, segments.Length); // MSH + MSA, no ERR on success
         var msh = segments[0].Split('|');
         Assert.Equal("MSH", msh[0]);
         Assert.Equal("^~\\&", msh[1]);
@@ -58,7 +74,7 @@ public class EndpointTests
         Assert.Equal("ACK^R01^ACK", msh[8]);
         Assert.Equal("P", msh[10]);
         Assert.Equal("2.5", msh[11]);
-        Assert.Equal("MSA|AA|CTRL-1|Received", segments[1]);
+        Assert.Equal("MSA|AA|CTRL-1|", segments[1]);
     }
 
     [Theory]
@@ -150,8 +166,9 @@ public class EndpointTests
         using var server = new TestServer();
         var result = await server.PostText(ValidOru.Replace(find, replace));
 
-        Assert.Equal(200, result.StatusCode);   // still received — validity is not the receiver's concern
-        Assert.Equal("AA", result.AckCode);
+        Assert.Equal(200, result.StatusCode);   // stored — and honestly NACKed
+        Assert.Equal("AE", result.AckCode);
+        Assert.Contains("ERR|||101^Required field missing^HL70357|E|", result.Body);
         Assert.Equal("rejected", result.Status);
         var row = server.Message(result.MessageId)!;
         Assert.Equal(code, (string)row.rejection_code);
@@ -169,6 +186,7 @@ public class EndpointTests
             "OBR|1|ORD1^RIS|ACC1^RIS|71020^CHEST^CPT|||20260101115500\r";
         var result = await server.PostText(text);
 
+        Assert.Equal("AE", result.AckCode);
         Assert.Equal("rejected", result.Status);
         Assert.Equal("SEGMENT_SEQUENCE", (string)server.Message(result.MessageId)!.rejection_code);
     }

@@ -3,14 +3,15 @@ using Hl7Receiver.Storage;
 namespace Hl7Receiver.Ingestion;
 
 /// <summary>
-/// Drains the <c>messages</c> queue (status = received) in receipt order, one message at a time.
+/// Drains the <c>messages</c> queue (status = queued) in receipt order, one message at a time, writing the
+/// reports/observations for messages the receiver already validated and ACKed.
 ///
 /// Why one worker: SQLite has a single writer anyway, per-message work is ~1 ms, and FIFO preserves per-sender
-/// ordering (a correction must not overtake its original). Bursts don't slow the *receipt* path — the receiver only
-/// does an INSERT — but a burst from provider A does delay processing of provider B's messages by however long A's
-/// queue takes; per-facility lanes are the next step if that ever matters (see README).
+/// ordering (a correction must not overtake its original). Bursts don't slow the *receipt* path — but a burst from
+/// provider A does delay report-writing for provider B by however long A's queue takes; per-facility lanes are the
+/// next step if that ever matters (see README).
 ///
-/// Durability: on startup it sweeps whatever was received but not processed before the last shutdown/crash; at
+/// Durability: on startup it sweeps whatever was queued but not completed before the last shutdown/crash; at
 /// runtime it wakes on <see cref="ProcessingQueue.Signal"/> and additionally sweeps every <see cref="SweepInterval"/>
 /// as a safety net. A message whose processing throws is marked <c>failed</c> (kept for replay) and the worker moves on.
 /// </summary>
@@ -30,7 +31,7 @@ public sealed class ProcessingWorker(
         await Task.Yield();
 
         var backlog = repository.CountPending();
-        logger.LogInformation("Processing worker started; {Pending} message(s) pending from before startup", backlog);
+        logger.LogInformation("Processing worker started; {Pending} message(s) queued from before startup", backlog);
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -89,8 +90,8 @@ public sealed class ProcessingWorker(
             }
             catch (Exception inner)
             {
-                // Can't even record the failure (storage down). Leave it 'received'; the next sweep retries it.
-                logger.LogError(inner, "Could not mark id={MessageId} as failed; it stays pending", id);
+                // Can't even record the failure (storage down). Leave it queued; the next sweep retries it.
+                logger.LogError(inner, "Could not mark id={MessageId} as failed; it stays queued", id);
                 throw;
             }
         }

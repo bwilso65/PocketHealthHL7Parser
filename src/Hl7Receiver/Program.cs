@@ -27,7 +27,8 @@ builder.Services.AddSingleton<OruValidator>();
 builder.Services.AddSingleton<IProviderProfileRegistry>(new ProviderProfileRegistry());
 builder.Services.AddSingleton(sp => new AckBuilder(receivingApplication, receivingFacility, sp.GetRequiredService<TimeProvider>()));
 
-// Receive (hot path) → queue → process (background)
+// Receive (sync: validate + store + ACK) → queue → process (async: write reports)
+builder.Services.AddSingleton<MessageEvaluator>();
 builder.Services.AddSingleton<ProcessingQueue>();
 builder.Services.AddSingleton<MessageReceiver>();
 builder.Services.AddSingleton<MessageProcessor>();
@@ -45,7 +46,8 @@ app.MapGet("/", () => Results.Text(
     HL7 ORU^R01 ingestion server
 
       POST /messages                 raw HL7 v2 message in the body (Content-Type: text/plain).
-                                     200 + HL7 ACK (AA "Received") once the bytes are stored; processing is async.
+                                     200 + HL7 ACK once the bytes are stored: MSA-1 = AA (valid, queued) / AE / AR.
+                                     Reports are written asynchronously (status queued -> accepted).
                                      JSON instead of the ACK with 'Accept: application/json'.
       GET  /messages/{id}            outcome of a message + extracted report(s)   (id from X-Message-Id / Location)
       GET  /messages/{id}/raw        the exact bytes received

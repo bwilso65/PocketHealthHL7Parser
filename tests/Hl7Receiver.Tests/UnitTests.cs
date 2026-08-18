@@ -63,31 +63,34 @@ public class AckBuilderTests
         new("POCKETHEALTH", "POCKETHEALTH", new FakeTimeProvider(new DateTimeOffset(2026, 8, 18, 14, 30, 0, TimeSpan.Zero)));
 
     [Fact]
-    public void Received_builds_MSH_and_MSA()
+    public void Accept_builds_MSH_and_MSA()
     {
-        var ack = Builder().Received(Original);
+        var ack = Builder().Accept(Original);
 
         Assert.Equal(
-            "MSH|^~\\&|POCKETHEALTH|POCKETHEALTH|RIS|WOODBINE|20260818143000+0000||ACK^R01^ACK|{id}|P|2.5\rMSA|AA|MSG00001|Received\r",
+            "MSH|^~\\&|POCKETHEALTH|POCKETHEALTH|RIS|WOODBINE|20260818143000+0000||ACK^R01^ACK|{id}|P|2.5\rMSA|AA|MSG00001|\r",
             ack.Replace(ack.Split('|')[9], "{id}"));
     }
 
     [Fact]
-    public void Free_text_has_delimiters_escaped()
+    public void Reject_adds_ERR_and_escapes_delimiters_in_free_text()
     {
-        var ack = Builder().Received(Original, "pipe | caret ^ tilde ~ amp & back \\ nl\n");
+        var ack = Builder().Reject(Original, Rejection.RequiredField("OBX-11", "status | with ^ delimiters & more"));
 
-        var msa = ack.TrimEnd('\r').Split('\r')[1];
-        Assert.Equal("MSA|AA|MSG00001|pipe \\F\\ caret \\S\\ tilde \\R\\ amp \\T\\ back \\E\\ nl ", msa);
+        var segments = ack.TrimEnd('\r').Split('\r');
+        Assert.Equal(3, segments.Length);
+        Assert.StartsWith("MSA|AE|MSG00001|OBX-11 (status \\F\\ with \\S\\ delimiters \\T\\ more)", segments[1]);
+        Assert.StartsWith("ERR|||101^Required field missing^HL70357|E||||OBX-11", segments[2]);
     }
 
     [Fact]
     public void Ack_for_unparseable_input_still_has_a_valid_shape()
     {
-        var ack = Builder().Received(MessageHeader.Empty);
+        var ack = Builder().Reject(MessageHeader.Empty, Rejection.Unparseable("nope"));
 
         Assert.StartsWith("MSH|^~\\&|POCKETHEALTH|POCKETHEALTH|||20260818143000+0000||ACK|", ack);
-        Assert.Contains("|P|2.5\rMSA|AA||Received\r", ack);
+        Assert.Contains("|P|2.5\rMSA|AR||nope\r", ack);
+        Assert.Contains("ERR|||100^Segment sequence error^HL70357|E||||nope\r", ack);
     }
 }
 

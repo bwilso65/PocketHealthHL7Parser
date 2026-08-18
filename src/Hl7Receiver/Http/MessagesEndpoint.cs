@@ -7,16 +7,21 @@ namespace Hl7Receiver.Http;
 /// <summary>
 /// POST /messages — one HL7 v2 message per request, raw in the body.
 ///
-/// The receiver's contract is receipt, not validity — "we either have the file or we don't":
-///   200  the bytes are durably stored and queued; body is an HL7 ACK (MSA-1 = AA, "Received")
+/// HTTP status is the *transport/commit* signal, the ACK body is the *application* verdict:
+///   200  we have durably stored your bytes; look at MSA-1: AA (validated, queued — or an idempotent duplicate),
+///        AE (content not acceptable), AR (can't/won't process this kind of message). ERR carries the HL7 error code.
 ///   400  there was nothing to store (empty body)
 ///   5xx  we could not store it — retry
-/// Woodbine's sender retries on non-2xx, so nothing about the *content* of a message ever produces a 4xx.
-/// Validation happens asynchronously (see ProcessingWorker); the verdict is at GET /messages/{id}.
+/// Woodbine's sender retries on non-2xx, so a permanently-bad message must NOT get a 4xx (it would retry forever);
+/// it gets 200 + AE/AR, is quarantined in the DB, and is visible in logs/queries. Same split as HL7's own
+/// commit-ack vs application-ack.
+///
+/// Validation is synchronous (the ACK is honest); writing the reports table is asynchronous (see ProcessingWorker),
+/// so an AA message shows status=queued briefly, then accepted.
 ///
 /// Response body: HL7 ACK (text/plain) by default; JSON with <c>Accept: application/json</c> for humans and tooling.
 ///
-/// GET /messages/{id}        — what happened to a message (received / accepted / duplicate / rejected / failed),
+/// GET /messages/{id}        — what happened to a message (queued / accepted / duplicate / rejected / failed),
 ///                             plus the extracted report(s) once accepted
 /// GET /messages/{id}/raw    — the exact bytes we received (inspect a quarantined message)
 /// GET /messages?controlId=&amp;facility=&amp;status=&amp;limit=  — find messages by what the sender knows (MSH-10)
@@ -51,11 +56,14 @@ public static class MessagesEndpoint
                 return Results.Json(new
                 {
                     messageId = receipt.MessageId,
-                    status = "received",
-                    ackCode = "AA",
+                    status = receipt.Status.ToString().ToLowerInvariant(),
+                    ackCode = receipt.AckCode.ToString(),
                     sender = new { application = receipt.Header.SendingApplication, facility = receipt.Header.SendingFacility },
                     messageControlId = receipt.Header.MessageControlId,
                     messageType = receipt.Header.MessageType,
+                    duplicateOf = receipt.DuplicateOf,
+                    payloadDiffersFromOriginal = receipt.Status == MessageStatus.Duplicate ? receipt.PayloadDiffersFromOriginal : (bool?)null,
+                    rejection = receipt.Rejection is null ? null : new { code = receipt.Rejection.Code, hl7ErrorCode = receipt.Rejection.Hl7ErrorCode, detail = receipt.Rejection.Detail },
                     href = $"/messages/{receipt.MessageId}",
                 }, statusCode: StatusCodes.Status200OK);
             }

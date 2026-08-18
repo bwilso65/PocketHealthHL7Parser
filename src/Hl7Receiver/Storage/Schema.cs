@@ -4,37 +4,43 @@ namespace Hl7Receiver.Storage;
 /// SQLite schema. Applied with CREATE ... IF NOT EXISTS on startup (no migration framework — see README).
 ///
 /// Three tables:
-///   messages      — every payload ever received, raw, with an outcome. Doubles as the durable processing queue
-///                   (status = received) and the quarantine (status = rejected / failed).
+///   messages      — every payload ever received, raw, with its verdict. Doubles as the durable work queue
+///                   (status = queued: validated, ACKed AA, reports not yet written) and the quarantine
+///                   (status = rejected / failed).
 ///   reports       — one row per OBR in an accepted message: the report a clinician/patient would look at
 ///   observations  — one row per OBX under a report (preserves structure; reports.report_text is the joined narrative)
+///
+/// Status lifecycle:
+///   at receipt (synchronous, before the ACK):  queued | duplicate | rejected | failed(validation threw)
+///   by the worker (asynchronous):              queued → accepted | failed
 /// </summary>
 public static class Schema
 {
     public const string Sql = """
         CREATE TABLE IF NOT EXISTS messages (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-            received_at         TEXT    NOT NULL,   -- ISO-8601 UTC, server clock, when the bytes were stored
-            processed_at        TEXT,               -- ISO-8601 UTC, when the worker reached a verdict
-            sending_application TEXT,               -- MSH-3   (best-effort from the raw header at receipt)
+            received_at         TEXT    NOT NULL,   -- ISO-8601 UTC, server clock, when the bytes were stored + ACKed
+            processed_at        TEXT,               -- ISO-8601 UTC, when the terminal status was reached (NULL while queued)
+            sending_application TEXT,               -- MSH-3   (best-effort from the raw header)
             sending_facility    TEXT,               -- MSH-4   (the provider)
             message_control_id  TEXT,               -- MSH-10
             message_type        TEXT,               -- MSH-9 as sent, e.g. ORU^R01
             processing_id       TEXT,               -- MSH-11 (P/T/D)
             hl7_version         TEXT,               -- MSH-12
-            status              TEXT    NOT NULL,   -- received | accepted | duplicate | rejected | failed
-            rejection_code      TEXT,               -- e.g. UNPARSEABLE, UNSUPPORTED_MESSAGE_TYPE (status = rejected only)
+            status              TEXT    NOT NULL,   -- queued | accepted | duplicate | rejected | failed
+            ack_code            TEXT,               -- MSA-1 we returned: AA | AE | AR
+            rejection_code      TEXT,               -- e.g. UNPARSEABLE, UNSUPPORTED_MESSAGE_TYPE (status = rejected/failed)
             detail              TEXT,               -- human-readable reason / note
-            duplicate_of        INTEGER REFERENCES messages(id),  -- status = duplicate: the accepted original
+            duplicate_of        INTEGER REFERENCES messages(id),  -- status = duplicate: the original
             raw_message         BLOB    NOT NULL,   -- exact bytes received
             raw_sha256          TEXT    NOT NULL
         );
 
-        -- Idempotency: one *accepted* message per (sender, control id). Retries land as status = duplicate.
-        -- Rejected messages are not part of the key: a corrected re-send with the same control id can be accepted.
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_accepted_identity
+        -- Idempotency: one live (queued or accepted) message per (sender, control id). Retries land as status = duplicate.
+        -- Rejected/failed messages are not part of the key: a corrected re-send with the same control id can be accepted.
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_messages_live_identity
             ON messages (sending_facility, IFNULL(sending_application, ''), message_control_id)
-            WHERE status = 'accepted';
+            WHERE status IN ('queued', 'accepted');
 
         CREATE INDEX IF NOT EXISTS ix_messages_received_at ON messages (received_at);
         CREATE INDEX IF NOT EXISTS ix_messages_status      ON messages (status, id);   -- the worker's queue scan

@@ -7,134 +7,179 @@ namespace Hl7Receiver.Storage;
 
 public enum MessageStatus
 {
-    /// <summary>Bytes stored, verdict pending (the queue).</summary>
-    Received,
+    /// <summary>Validated and ACKed AA; reports not yet written (the work queue).</summary>
+    Queued,
+    /// <summary>Reports written. Terminal.</summary>
     Accepted,
+    /// <summary>Same (sender, control id) as a live message; ACKed AA, not reprocessed. Terminal.</summary>
     Duplicate,
+    /// <summary>Failed validation at receipt; ACKed AE/AR. Terminal, kept for inspection/replay.</summary>
     Rejected,
-    /// <summary>Processing threw (bug, storage error). Kept for replay; never silently dropped.</summary>
+    /// <summary>Something threw (validation at receipt, or extraction in the worker). Kept for replay. Terminal.</summary>
     Failed,
 }
 
 /// <summary>Everything we know about a payload the moment it arrives. Stored regardless of what happens next.</summary>
 public sealed record MessageReceipt(DateTimeOffset ReceivedAt, byte[] Raw, string Sha256, MessageHeader Header);
 
-/// <summary>A queued message handed to the processor.</summary>
-public sealed record PendingMessage(long Id, byte[] Raw, string Sha256);
+/// <summary>What the receiver decided synchronously, before the row is written.</summary>
+public abstract record ReceiptVerdict
+{
+    public sealed record Valid : ReceiptVerdict;
+    public sealed record Rejected(Rejection Rejection) : ReceiptVerdict;
+}
 
-/// <summary>Result of reaching a verdict on a message.</summary>
-/// <param name="DuplicateOf">For duplicates: the row id of the accepted original.</param>
-/// <param name="PayloadDiffersFromOriginal">For duplicates: the retry's bytes differ from what we accepted (sender bug worth flagging).</param>
-public sealed record PersistOutcome(MessageStatus Status, long? DuplicateOf = null, bool PayloadDiffersFromOriginal = false, int ReportCount = 0);
+/// <summary>The row as stored at receipt.</summary>
+public sealed record StoredReceipt(long MessageId, MessageStatus Status, AckCode AckCode, long? DuplicateOf = null, bool PayloadDiffersFromOriginal = false);
+
+/// <summary>A queued message handed to the worker.</summary>
+public sealed record PendingMessage(long Id, byte[] Raw, string Sha256);
 
 /// <summary>
 /// All writes go through here. Each public method is one SQLite transaction.
-/// The receiver only ever calls <see cref="InsertReceived"/>; everything else is the worker's.
+/// The receiver only ever calls <see cref="StoreReceipt"/>; everything else is the worker's.
 /// </summary>
 public sealed class MessageRepository(Database database)
 {
     // ---- receipt (the hot path) ------------------------------------------------------------------
 
-    /// <summary>Stores the raw payload with status = received and returns its id. This is the "we have your bytes" moment.</summary>
-    public long InsertReceived(MessageReceipt receipt)
+    /// <summary>
+    /// Stores the raw payload with its receipt-time verdict and returns the row. This is the "we have your bytes"
+    /// moment — the ACK is not sent until this commits.
+    /// For a valid message, checks idempotency inside the same BEGIN IMMEDIATE transaction (SQLite has a single
+    /// writer, so two concurrent retries cannot both become queued): if a live message with the same
+    /// (sender, control id) exists, this one is stored as <c>duplicate</c> instead. The partial unique index is the backstop.
+    /// </summary>
+    public StoredReceipt StoreReceipt(MessageReceipt receipt, ReceiptVerdict verdict)
     {
         using var connection = database.Open();
+        using var tx = connection.BeginTransaction(IsolationLevel.Serializable);
+
+        StoredReceipt result;
+        switch (verdict)
+        {
+            case ReceiptVerdict.Rejected r:
+            {
+                var status = r.Rejection.Code == "PROCESSING_ERROR" ? MessageStatus.Failed : MessageStatus.Rejected;
+                var id = Insert(connection, tx, receipt, status, r.Rejection.Ack, r.Rejection.Code, r.Rejection.Detail, duplicateOf: null, terminal: true);
+                result = new StoredReceipt(id, status, r.Rejection.Ack);
+                break;
+            }
+            case ReceiptVerdict.Valid:
+            {
+                var h = receipt.Header;
+                var original = connection.QuerySingleOrDefault<LiveRow>(
+                    """
+                    SELECT id AS Id, raw_sha256 AS Sha256 FROM messages
+                    WHERE status IN ('queued', 'accepted')
+                      AND sending_facility = @Facility
+                      AND IFNULL(sending_application, '') = IFNULL(@Application, '')
+                      AND message_control_id = @ControlId
+                    """,
+                    new { Facility = h.SendingFacility, Application = h.SendingApplication, ControlId = h.MessageControlId },
+                    tx);
+
+                if (original is not null)
+                {
+                    var differs = !string.Equals(original.Sha256, receipt.Sha256, StringComparison.OrdinalIgnoreCase);
+                    var note = differs
+                        ? $"Duplicate of message #{original.Id}; payload DIFFERS from the original (not reprocessed)"
+                        : $"Duplicate of message #{original.Id}; identical payload (not reprocessed)";
+                    var id = Insert(connection, tx, receipt, MessageStatus.Duplicate, AckCode.AA, rejectionCode: null, note, original.Id, terminal: true);
+                    result = new StoredReceipt(id, MessageStatus.Duplicate, AckCode.AA, original.Id, differs);
+                }
+                else
+                {
+                    var id = Insert(connection, tx, receipt, MessageStatus.Queued, AckCode.AA, rejectionCode: null, detail: null, duplicateOf: null, terminal: false);
+                    result = new StoredReceipt(id, MessageStatus.Queued, AckCode.AA);
+                }
+                break;
+            }
+            default:
+                throw new ArgumentOutOfRangeException(nameof(verdict));
+        }
+
+        tx.Commit();
+        return result;
+    }
+
+    private static long Insert(SqliteConnection connection, SqliteTransaction tx, MessageReceipt receipt, MessageStatus status,
+        AckCode ackCode, string? rejectionCode, string? detail, long? duplicateOf, bool terminal)
+    {
         var h = receipt.Header;
         return connection.ExecuteScalar<long>(
             """
             INSERT INTO messages (
-                received_at, sending_application, sending_facility, message_control_id, message_type,
-                processing_id, hl7_version, status, raw_message, raw_sha256)
+                received_at, processed_at, sending_application, sending_facility, message_control_id, message_type,
+                processing_id, hl7_version, status, ack_code, rejection_code, detail, duplicate_of, raw_message, raw_sha256)
             VALUES (
-                @ReceivedAt, @SendingApplication, @SendingFacility, @MessageControlId, @MessageType,
-                @ProcessingId, @Hl7Version, 'received', @Raw, @Sha256);
+                @ReceivedAt, @ProcessedAt, @SendingApplication, @SendingFacility, @MessageControlId, @MessageType,
+                @ProcessingId, @Hl7Version, @Status, @AckCode, @RejectionCode, @Detail, @DuplicateOf, @Raw, @Sha256);
             SELECT last_insert_rowid();
             """,
             new
             {
                 ReceivedAt = Iso(receipt.ReceivedAt),
+                ProcessedAt = terminal ? Iso(receipt.ReceivedAt) : null,
                 h.SendingApplication,
                 h.SendingFacility,
                 h.MessageControlId,
                 h.MessageType,
                 h.ProcessingId,
                 Hl7Version = h.VersionId,
+                Status = StatusText(status),
+                AckCode = ackCode.ToString(),
+                RejectionCode = rejectionCode,
+                Detail = detail,
+                DuplicateOf = duplicateOf,
                 receipt.Raw,
                 receipt.Sha256,
-            });
+            },
+            tx);
     }
 
     // ---- queue ---------------------------------------------------------------------------------------
 
-    /// <summary>Oldest pending message ids, in receipt order (FIFO — preserves per-sender ordering).</summary>
+    /// <summary>Oldest queued message ids, in receipt order (FIFO — preserves per-sender ordering).</summary>
     public IReadOnlyList<long> NextPending(int limit)
     {
         using var connection = database.Open();
         return connection.Query<long>(
-            "SELECT id FROM messages WHERE status = 'received' ORDER BY id LIMIT @Limit", new { Limit = limit }).ToList();
+            "SELECT id FROM messages WHERE status = 'queued' ORDER BY id LIMIT @Limit", new { Limit = limit }).ToList();
     }
 
     public int CountPending()
     {
         using var connection = database.Open();
-        return connection.ExecuteScalar<int>("SELECT COUNT(*) FROM messages WHERE status = 'received'");
+        return connection.ExecuteScalar<int>("SELECT COUNT(*) FROM messages WHERE status = 'queued'");
     }
 
-    /// <summary>The raw payload of a message that is still pending, or null if it isn't (already processed / unknown).</summary>
+    /// <summary>The raw payload of a message that is still queued, or null if it isn't (already processed / unknown).</summary>
     public PendingMessage? LoadPending(long id)
     {
         using var connection = database.Open();
         return connection.QuerySingleOrDefault<PendingMessage>(
-            "SELECT id AS Id, raw_message AS Raw, raw_sha256 AS Sha256 FROM messages WHERE id = @Id AND status = 'received'",
+            "SELECT id AS Id, raw_message AS Raw, raw_sha256 AS Sha256 FROM messages WHERE id = @Id AND status = 'queued'",
             new { Id = id });
     }
 
-    // ---- verdicts (the worker) -----------------------------------------------------------------------
+    // ---- completion (the worker) ---------------------------------------------------------------------
 
     /// <summary>
-    /// Records an accepted message and its reports — unless a message with the same (sender, control id) has already
-    /// been accepted, in which case this one is marked <c>duplicate</c> and the original is left untouched.
-    /// <see cref="IsolationLevel.Serializable"/> maps to BEGIN IMMEDIATE, so the check-then-write is race-free; the
-    /// partial unique index is the backstop. Returns null if the message was no longer pending (already processed).
+    /// Writes the extracted reports/observations and moves the message from queued to accepted.
+    /// Returns false if the message was no longer queued (someone else completed it) — nothing is written in that case.
     /// </summary>
-    public PersistOutcome? MarkAccepted(long id, MessageHeader header, string sha256, OruMessage oru, DateTimeOffset now)
+    public bool MarkAccepted(long id, MessageHeader header, OruMessage oru, DateTimeOffset now)
     {
         using var connection = database.Open();
         using var tx = connection.BeginTransaction(IsolationLevel.Serializable);
 
-        var original = connection.QuerySingleOrDefault<AcceptedRow>(
-            """
-            SELECT id AS Id, raw_sha256 AS Sha256 FROM messages
-            WHERE status = 'accepted'
-              AND id <> @Id
-              AND sending_facility = @Facility
-              AND IFNULL(sending_application, '') = IFNULL(@Application, '')
-              AND message_control_id = @ControlId
-            """,
-            new { Id = id, Facility = header.SendingFacility, Application = header.SendingApplication, ControlId = header.MessageControlId },
-            tx);
-
-        if (original is not null)
+        if (!SetTerminal(connection, tx, id, MessageStatus.Accepted, rejectionCode: null, detail: null, now))
         {
-            var differs = !string.Equals(original.Sha256, sha256, StringComparison.OrdinalIgnoreCase);
-            var note = differs
-                ? $"Duplicate of message #{original.Id}; payload DIFFERS from the accepted original (not reprocessed)"
-                : $"Duplicate of message #{original.Id}; identical payload (not reprocessed)";
-
-            if (!SetVerdict(connection, tx, id, MessageStatus.Duplicate, rejectionCode: null, detail: note, duplicateOf: original.Id, now))
-            {
-                return null;
-            }
-            tx.Commit();
-            return new PersistOutcome(MessageStatus.Duplicate, original.Id, differs);
+            return false;
         }
 
-        if (!SetVerdict(connection, tx, id, MessageStatus.Accepted, rejectionCode: null, detail: null, duplicateOf: null, now))
-        {
-            return null;
-        }
         var createdAt = Iso(now);
-
         foreach (var report in oru.Reports)
         {
             var reportId = connection.ExecuteScalar<long>(
@@ -192,51 +237,43 @@ public sealed class MessageRepository(Database database)
         }
 
         tx.Commit();
-        return new PersistOutcome(MessageStatus.Accepted, ReportCount: oru.Reports.Count);
+        return true;
     }
 
-    /// <returns>false if the message was no longer pending.</returns>
-    public bool MarkRejected(long id, Rejection rejection, DateTimeOffset now)
-    {
-        using var connection = database.Open();
-        using var tx = connection.BeginTransaction(IsolationLevel.Serializable);
-        var done = SetVerdict(connection, tx, id, MessageStatus.Rejected, rejection.Code, rejection.Detail, duplicateOf: null, now);
-        tx.Commit();
-        return done;
-    }
-
-    /// <returns>false if the message was no longer pending.</returns>
+    /// <returns>false if the message was no longer queued.</returns>
     public bool MarkFailed(long id, string error, DateTimeOffset now)
     {
         using var connection = database.Open();
         using var tx = connection.BeginTransaction(IsolationLevel.Serializable);
-        var done = SetVerdict(connection, tx, id, MessageStatus.Failed, rejectionCode: "PROCESSING_ERROR", detail: error, duplicateOf: null, now);
+        var done = SetTerminal(connection, tx, id, MessageStatus.Failed, rejectionCode: "PROCESSING_ERROR", detail: error, now);
         tx.Commit();
         return done;
     }
 
     /// <summary>
-    /// Moves a message from 'received' to its verdict. Guarded by <c>status = 'received'</c> so a verdict is written
+    /// Moves a message from 'queued' to a terminal status. Guarded by <c>status = 'queued'</c> so the transition happens
     /// exactly once even if two drainers ever race on the same row; returns false if someone got there first.
     /// </summary>
-    private static bool SetVerdict(SqliteConnection connection, SqliteTransaction tx, long id, MessageStatus status,
-        string? rejectionCode, string? detail, long? duplicateOf, DateTimeOffset now)
+    private static bool SetTerminal(SqliteConnection connection, SqliteTransaction tx, long id, MessageStatus status,
+        string? rejectionCode, string? detail, DateTimeOffset now)
     {
         var updated = connection.Execute(
             """
             UPDATE messages
-            SET status = @Status, processed_at = @ProcessedAt, rejection_code = @RejectionCode, detail = @Detail, duplicate_of = @DuplicateOf
-            WHERE id = @Id AND status = 'received'
+            SET status = @Status, processed_at = @ProcessedAt, rejection_code = @RejectionCode, detail = @Detail
+            WHERE id = @Id AND status = 'queued'
             """,
-            new { Id = id, Status = status.ToString().ToLowerInvariant(), ProcessedAt = Iso(now), RejectionCode = rejectionCode, Detail = detail, DuplicateOf = duplicateOf },
+            new { Id = id, Status = StatusText(status), ProcessedAt = Iso(now), RejectionCode = rejectionCode, Detail = detail },
             tx);
 
         return updated == 1;
     }
 
+    private static string StatusText(MessageStatus status) => status.ToString().ToLowerInvariant();
+
     private static string Iso(DateTimeOffset t) => t.UtcDateTime.ToString("O");
 
-    private sealed class AcceptedRow
+    private sealed class LiveRow
     {
         public long Id { get; set; }
         public string Sha256 { get; set; } = string.Empty;

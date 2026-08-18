@@ -4,23 +4,24 @@ namespace Hl7Receiver.Tests;
 /// The provider's sample files, posted in their numbered order into one server (04 is only a "duplicate" if 02
 /// was accepted first). This is the executable form of the behaviour matrix in PLAN.md / README.md.
 ///
-/// Every POST gets 200 + an AA "Received" ACK — the receiver's contract is receipt, not validity. The verdict is
-/// reached by the background worker and read back from the database (or GET /messages/{id}).
+/// Every POST gets HTTP 200 (the bytes were stored). The ACK carries the validation verdict synchronously
+/// (AA / AE / AR); for AA messages the reports are written by the background worker, so the final status is read
+/// back from the database after the worker has run.
 /// </summary>
 public class SampleBehaviorTests
 {
-    public sealed record Expectation(string File, string FinalStatus, string? RejectionCode, int Reports);
+    public sealed record Expectation(string File, string Ack, string FinalStatus, string? RejectionCode, int Reports);
 
     public static readonly Expectation[] Matrix =
     [
-        new("01_oru_valid_minimal.hl7",     "accepted",  null,                        1),
-        new("02_oru_valid_01.hl7",          "accepted",  null,                        1),
-        new("03_oru_valid_02.hl7",          "accepted",  null,                        1),
-        new("04_oru_duplicate_retry.hl7",   "duplicate", null,                        0),
-        new("05_malformed.hl7",             "rejected",  "UNPARSEABLE",               0),
-        new("06_malformed_double_msh.hl7",  "rejected",  "MULTIPLE_MSH",              0),
-        new("07_malformed_truncated.hl7",   "rejected",  "REQUIRED_FIELD_MISSING",    0),
-        new("08_adt_wrong_type.hl7",        "rejected",  "UNSUPPORTED_MESSAGE_TYPE",  0),
+        new("01_oru_valid_minimal.hl7",     "AA", "accepted",  null,                        1),
+        new("02_oru_valid_01.hl7",          "AA", "accepted",  null,                        1),
+        new("03_oru_valid_02.hl7",          "AA", "accepted",  null,                        1),
+        new("04_oru_duplicate_retry.hl7",   "AA", "duplicate", null,                        0),
+        new("05_malformed.hl7",             "AR", "rejected",  "UNPARSEABLE",               0),
+        new("06_malformed_double_msh.hl7",  "AR", "rejected",  "MULTIPLE_MSH",              0),
+        new("07_malformed_truncated.hl7",   "AE", "rejected",  "REQUIRED_FIELD_MISSING",    0),
+        new("08_adt_wrong_type.hl7",        "AR", "rejected",  "UNSUPPORTED_MESSAGE_TYPE",  0),
     ];
 
     [Fact]
@@ -43,7 +44,8 @@ public class SampleBehaviorTests
             }
 
             Check("HTTP status", 200, result.StatusCode);
-            Check("MSA-1", "AA", result.AckCode);
+            Check("MSA-1", e.Ack, result.AckCode);
+            Check("messages.ack_code", e.Ack, (string?)row?.ack_code);
             Check("messages.status", e.FinalStatus, (string?)row?.status);
             Check("messages.rejection_code", e.RejectionCode, (string?)row?.rejection_code);
             Check("processed_at set", true, row?.processed_at is not null);
@@ -57,7 +59,7 @@ public class SampleBehaviorTests
         // Nothing is ever dropped: one messages row per POST, every row has the raw bytes, nothing left in the queue.
         Assert.Equal(Matrix.Length, server.Scalar<long>("SELECT COUNT(*) FROM messages"));
         Assert.Equal(0, server.Scalar<long>("SELECT COUNT(*) FROM messages WHERE raw_message IS NULL OR length(raw_message) = 0"));
-        Assert.Equal(0, server.Scalar<long>("SELECT COUNT(*) FROM messages WHERE status = 'received'"));
+        Assert.Equal(0, server.Scalar<long>("SELECT COUNT(*) FROM messages WHERE status = 'queued'"));
     }
 
     [Fact]
@@ -104,6 +106,7 @@ public class SampleBehaviorTests
 
         Assert.Equal(200, retry.StatusCode);
         Assert.Equal("AA", retry.AckCode);                       // the sender's retry succeeds and stops
+        Assert.Contains("MSA|AA|MSG00001|Duplicate", retry.Body);
         Assert.Equal("duplicate", retry.Status);
 
         var row = server.Message(retry.MessageId)!;
@@ -137,13 +140,15 @@ public class SampleBehaviorTests
         using var server = new TestServer();
 
         var malformed = await server.PostSample("05_malformed.hl7");
-        Assert.Equal("AA", malformed.AckCode);                          // receipt, not a verdict
+        Assert.Equal(200, malformed.StatusCode);                        // stored...
+        Assert.Equal("AR", malformed.AckCode);                          // ...and honestly rejected
         Assert.StartsWith("MSH|^~\\&|POCKETHEALTH|POCKETHEALTH|RIS|HOSP|", malformed.Body);
-        Assert.Contains("MSA|AA||Received", malformed.Body);           // no control id to echo
+        Assert.Contains("MSA|AR||", malformed.Body);                     // no control id to echo
+        Assert.Contains("ERR|||100^Segment sequence error^HL70357|E|", malformed.Body);
         var row = server.Message(malformed.MessageId)!;
         Assert.Equal("rejected", (string)row.status);
         Assert.Equal("UNPARSEABLE", (string)row.rejection_code);
-        Assert.Equal("RIS", (string)row.sending_application);           // sniffed from the broken MSH at receipt
+        Assert.Equal("RIS", (string)row.sending_application);           // sniffed from the broken MSH
         Assert.Equal("HOSP", (string)row.sending_facility);
         Assert.Null(row.message_control_id);
         Assert.Equal(TestServer.Sample("05_malformed.hl7"), (byte[])row.raw_message);
@@ -152,12 +157,14 @@ public class SampleBehaviorTests
         row = server.Message(adt.MessageId)!;
         Assert.Equal("ADT^A01", (string)row.message_type);
         Assert.Equal("MSG00200", (string)row.message_control_id);
-        Assert.Contains("ADT^A01", (string)row.detail);
-        Assert.Contains("MSA|AA|MSG00200|Received", adt.Body);
+        Assert.Contains("MSA|AR|MSG00200|", adt.Body);
+        Assert.Contains("ERR|||200^Unsupported message type^HL70357|E|", adt.Body);
 
         var truncated = await server.PostSample("07_malformed_truncated.hl7");
         row = server.Message(truncated.MessageId)!;
         Assert.Contains("OBX-11", (string)row.detail);
+        Assert.Contains("MSA|AE|MSG00400|", truncated.Body);
+        Assert.Contains("ERR|||101^Required field missing^HL70357|E|", truncated.Body);
 
         var doubled = await server.PostSample("06_malformed_double_msh.hl7");
         row = server.Message(doubled.MessageId)!;

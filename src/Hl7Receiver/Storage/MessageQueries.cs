@@ -8,11 +8,11 @@ namespace Hl7Receiver.Storage;
 /// </summary>
 public sealed class MessageQueries(Database database)
 {
-    public static readonly string[] Statuses = ["received", "accepted", "duplicate", "rejected", "failed"];
+    public static readonly string[] Statuses = ["queued", "accepted", "duplicate", "rejected", "failed"];
 
     private const string SummaryColumns = """
         m.id, m.received_at, m.processed_at, m.sending_application, m.sending_facility, m.message_control_id, m.message_type,
-        m.processing_id, m.hl7_version, m.status, m.rejection_code, m.detail, m.duplicate_of, m.raw_sha256,
+        m.processing_id, m.hl7_version, m.status, m.ack_code, m.rejection_code, m.detail, m.duplicate_of, m.raw_sha256,
         (SELECT COUNT(*) FROM reports r WHERE r.message_id = m.id) AS report_count
         """;
 
@@ -55,7 +55,7 @@ public sealed class MessageQueries(Database database)
                 .ToList()))
             .ToList();
 
-        return new MessageView(m.Id, m.ReceivedAt, m.ProcessedAt, m.Status, new SenderView(m.SendingApplication, m.SendingFacility),
+        return new MessageView(m.Id, m.ReceivedAt, m.ProcessedAt, m.Status, m.AckCode, new SenderView(m.SendingApplication, m.SendingFacility),
             m.MessageControlId, m.MessageType, m.ProcessingId, m.Hl7Version, Rejection(m), m.DuplicateOf, m.Detail,
             m.RawSha256, reports);
     }
@@ -86,7 +86,7 @@ public sealed class MessageQueries(Database database)
             """,
             new { ControlId = controlId, Facility = facility, Status = status, Limit = limit });
 
-        return rows.Select(m => new MessageSummaryView(m.Id, m.ReceivedAt, m.ProcessedAt, m.Status,
+        return rows.Select(m => new MessageSummaryView(m.Id, m.ReceivedAt, m.ProcessedAt, m.Status, m.AckCode,
                 new SenderView(m.SendingApplication, m.SendingFacility), m.MessageControlId, m.MessageType,
                 m.ProcessingId, m.Hl7Version, Rejection(m), m.DuplicateOf, m.Detail, m.RawSha256, m.ReportCount))
             .ToList();
@@ -109,6 +109,7 @@ public sealed class MessageQueries(Database database)
         public string? ProcessingId { get; set; }
         public string? Hl7Version { get; set; }
         public string Status { get; set; } = string.Empty;
+        public string? AckCode { get; set; }
         public string? RejectionCode { get; set; }
         public string? Detail { get; set; }
         public long? DuplicateOf { get; set; }

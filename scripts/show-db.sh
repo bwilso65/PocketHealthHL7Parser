@@ -7,10 +7,10 @@ q() {
   docker compose exec -T hl7-server sqlite3 -header -column /app/data/messages.db "$1"
 }
 
-echo "== messages: every payload received, with outcome (status=received means still queued) =="
+echo "== messages: every payload received, with the ACK we sent and the outcome (status=queued: reports not written yet) =="
 q "SELECT id, substr(received_at, 12, 12) AS received, substr(processed_at, 12, 12) AS processed,
           sending_facility AS facility, message_control_id AS control_id, message_type AS type,
-          status, rejection_code, duplicate_of, substr(detail, 1, 50) AS detail
+          ack_code AS ack, status, rejection_code, duplicate_of, substr(detail, 1, 45) AS detail
    FROM messages ORDER BY id;"
 
 echo

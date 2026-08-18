@@ -95,14 +95,14 @@ public sealed class TestServer : IDisposable
         return new PostResult((int)response.StatusCode, text, id, status);
     }
 
-    /// <summary>Polls until the worker has moved the message out of 'received'. Processing normally takes milliseconds.</summary>
+    /// <summary>Polls until the worker has moved the message out of 'queued'. Processing normally takes milliseconds.</summary>
     public async Task<string> WaitProcessed(string messageId, TimeSpan? timeout = null)
     {
         var deadline = DateTime.UtcNow + (timeout ?? TimeSpan.FromSeconds(10));
         while (true)
         {
             var status = (string?)Message(messageId)?.status;
-            if (status is not null && status != "received")
+            if (status is not null && status != "queued")
             {
                 return status;
             }

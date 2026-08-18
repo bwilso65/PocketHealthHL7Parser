@@ -1,8 +1,9 @@
 # HL7 ORU Ingestion Server
 
-Receives HL7 v2 `ORU^R01` radiology reports over HTTP, stores **every** payload raw in SQLite and acknowledges it
-immediately, then — asynchronously — validates each message and extracts the patient / order / report content from
-the ones that pass. Built for Woodbine Health first, with a seam for the next providers' quirks.
+Receives HL7 v2 `ORU^R01` radiology reports over HTTP. Every payload is validated and stored raw in SQLite before
+the sender gets an honest HL7 ACK (`AA` / `AE` / `AR`); the patient / order / report content of accepted messages is
+then extracted and written by a background worker. Built for Woodbine Health first, with a seam for the next
+providers' quirks.
 
 C# / .NET 10 · ASP.NET Core minimal API · [HL7-V2](https://github.com/Efferent-Health/HL7-V2) parser ·
 Microsoft.Data.Sqlite + Dapper · xUnit. See [PLAN.md](PLAN.md) for the plan/prompt log and full decision log.
@@ -18,7 +19,7 @@ The server listens on `http://localhost:8080`. The database is `./data/messages.
 ## Test
 
 ```bash
-# Unit + integration tests (67), inside Docker
+# Unit + integration tests (69), inside Docker
 docker compose --profile test run --rm tests
 
 # Post every sample message: prints the ACK for each, then each message's verdict from GET /messages/{id}
@@ -33,7 +34,7 @@ Or by hand — send one, then look it up (the `X-Message-Id` / `Location` header
 
 ```bash
 curl -i -X POST http://localhost:8080/messages -H "Content-Type: text/plain" --data-binary @samples/02_oru_valid_01.hl7
-curl -s http://localhost:8080/messages/1              # status (received → accepted/duplicate/rejected) + patient + report
+curl -s http://localhost:8080/messages/1              # status (queued → accepted, or duplicate/rejected) + patient + report
 curl -s http://localhost:8080/messages/1/raw          # the exact bytes we received
 curl -s "http://localhost:8080/messages?controlId=MSG00001"          # by the sender's control ID (MSH-10)
 curl -s "http://localhost:8080/messages?status=rejected&limit=20"    # what's in quarantine
@@ -52,53 +53,59 @@ docker compose exec hl7-server sqlite3 -header -column /app/data/messages.db \
 ## What it does
 
 ```
- receive (sync, per request)                     process (async, one background worker, FIFO)
- ─────────────────────────────                   ──────────────────────────────────────────────────────────────────────
- POST /messages ─▶ store raw bytes ─▶ 200 + ACK   ─▶ decode ─▶ parse ─▶ validate envelope ─▶ extract ─▶ validate content ─▶ verdict
-                   status = received  "Received"     (charset)  (syntax)  (1 msg, ORU^R01,      (PID/OBR/     (required fields,     accepted
-                   + wake the worker                                       known sender)          OBX)          OBX-11 present)       duplicate
-                                                                                                                                       rejected
+ receive (synchronous, per request, ~1 ms)                                             process (async, one worker, FIFO)
+ ───────────────────────────────────────────────────────────────────────────────────    ─────────────────────────────────
+ POST /messages ─▶ decode ─▶ parse ─▶ validate ─▶ extract ─▶ validate ─▶ dup check ─▶ store raw ─▶ ACK    ─▶ re-extract ─▶ write reports
+                   (charset)  (syntax)  envelope    (PID/OBR/   content     (facility+    + verdict    AA/AE/AR      from raw     status = accepted
+                                        (1 msg,     OBX)        (required   app+ctrl id)  status =    (+ ERR)       bytes
+                                        ORU^R01,                fields,                   queued /
+                                        sender)                 OBX-11)                   rejected /
+                                                                                          duplicate
 ```
 
-**Response contract** — the receiver's promise is *receipt*, not validity ("we either have the file or we don't"):
+**Response contract** — HTTP status is the *commit* signal; the ACK body is the *application* verdict:
 
 | HTTP | Meaning | Body |
 |---|---|---|
-| `200` | Your bytes are durably stored and queued. Nothing about the *content* changes this. | HL7 ACK: `MSA\|AA\|<your control id>\|Received` — or a JSON receipt with `Accept: application/json` |
+| `200` | We have durably stored your bytes. Look at `MSA-1`: `AA` valid → queued (or an idempotent duplicate); `AE` understood, content not acceptable; `AR` can't/won't process this kind of message. | HL7 ACK (`MSH`, `MSA`, `ERR` on error) — or a JSON receipt with `Accept: application/json` |
 | `400` | Nothing to store (empty body). | text |
 | `5xx` | We could not store it — retry. | — |
 
-The verdict is reached by the worker (normally within milliseconds) and is visible at `GET /messages/{id}`, in the
-`messages` table, and in the logs. Every request lands in `messages` with `status ∈ {received, accepted, duplicate,
-rejected, failed}`, the raw bytes, and a reason. Accepted messages additionally produce `reports` (one per OBR, with
-the patient snapshot and the newline-joined report text) and `observations` (one per OBX).
-Schema: [Schema.cs](src/Hl7Receiver/Storage/Schema.cs).
+No ACK is sent before the row is committed, and the row carries the same verdict as the ACK. Every request lands
+in `messages` with `status ∈ {queued, accepted, duplicate, rejected, failed}`, `ack_code`, the raw bytes, and a
+reason. `AA` messages are `queued` until the worker writes their `reports` (one per OBR, with the patient snapshot
+and the newline-joined report text) and `observations` (one per OBX) and marks them `accepted` — normally within
+milliseconds. Schema: [Schema.cs](src/Hl7Receiver/Storage/Schema.cs).
 
-The `messages` table **is** the queue: `status = received` rows are pending, the worker sweeps them on startup
-(so nothing received before a crash/restart is lost), wakes on each new receipt, and re-sweeps every 30 s as a safety
-net. `GET /healthz` reports the queue depth.
+The `messages` table **is** the work queue: `status = queued` rows are pending, the worker sweeps them on startup
+(so nothing ACKed before a crash/restart is lost), wakes on each new receipt, and re-sweeps every 30 s as a safety
+net. `GET /healthz` reports the queue depth. If validation itself throws (our bug), the bytes are still stored
+(`failed`, replayable) and the sender gets `AE` with HL7 error 207 — a retry would not help.
 
 **Reading it back** (JSON):
 
 | Endpoint | Returns |
 |---|---|
-| `GET /messages/{id}` | status (`received` while queued), rejection reason, duplicate-of, `processedAt`, + the extracted reports: patient, procedure, report text, observations |
+| `GET /messages/{id}` | status, the `ackCode` we returned, rejection reason, duplicate-of, `processedAt`, + the extracted reports: patient, procedure, report text, observations |
 | `GET /messages/{id}/raw` | the exact bytes received — inspect a quarantined message |
 | `GET /messages?controlId=&facility=&status=&limit=` | search, newest first; `controlId` is what the sender knows (MSH-10) and is only unique per `facility` |
 | `GET /healthz` | liveness + `pending` queue depth |
 
 ### Behaviour for the sample messages
 
-Every one of these gets `200` + `MSA|AA|…|Received` at POST time. The interesting column is the verdict:
+Every one of these gets HTTP `200` (the bytes were stored). The ACK carries the verdict:
 
-| Sample | Verdict (`messages.status`) | Why |
-|---|---|---|
-| 01 minimal, 02 full, 03 other sender | accepted | 03 shows the sender is data (MSH-4), not a hard-coded "WOODBINE" |
-| 04 same control ID as 02, different body | duplicate → points at #2 | Idempotent: the stored report is untouched; the body-hash mismatch is recorded in `detail` and logged as a warning |
-| 05 broken MSH | rejected `UNPARSEABLE` | Can't parse; sender/facility still sniffed from the partial MSH at receipt; raw kept |
-| 06 two messages in one payload | rejected `MULTIPLE_MSH` | One request = one message. Splitting would hide the sender's bug; taking only the first would silently drop a report. Raw kept, replayable |
-| 07 truncated mid-OBX | rejected `REQUIRED_FIELD_MISSING` (OBX-11) | Result status is HL7-required and is the truncation tell. A partial radiology report stored as complete is a patient-safety problem |
-| 08 ADT^A01 | rejected `UNSUPPORTED_MESSAGE_TYPE` | Not a report. Raw kept in case ADT becomes in-scope |
+| Sample | ACK | `messages.status` | Why |
+|---|---|---|---|
+| 01 minimal, 02 full, 03 other sender | AA | queued → accepted | 03 shows the sender is data (MSH-4), not a hard-coded "WOODBINE" |
+| 04 same control ID as 02, different body | AA + "Duplicate…" | duplicate → points at #2 | Idempotent: the retry succeeds so the sender stops; the stored report is untouched; the body-hash mismatch is recorded in `detail` and logged as a warning |
+| 05 broken MSH | AR + `ERR` 100 | rejected `UNPARSEABLE` | Can't parse; sender/facility still sniffed from the partial MSH; raw kept |
+| 06 two messages in one payload | AR + `ERR` 100 | rejected `MULTIPLE_MSH` | One request = one message = one ACK. Splitting would hide the sender's bug; taking only the first would silently drop a report. Raw kept, replayable |
+| 07 truncated mid-OBX | AE + `ERR` 101 | rejected `REQUIRED_FIELD_MISSING` (OBX-11) | Result status is HL7-required and is the truncation tell. A partial radiology report stored as complete is a patient-safety problem |
+| 08 ADT^A01 | AR + `ERR` 200 | rejected `UNSUPPORTED_MESSAGE_TYPE` | Not a report. Raw kept in case ADT becomes in-scope |
+
+`AE` vs `AR` follows HL7's intent: AR = "can't/won't process this kind of thing" (syntax, type, structure),
+AE = "understood it, content isn't acceptable" (missing required field). The `ERR` segment carries a table-0357 code.
 
 Leniency we chose: `\r`, `\n`, `\r\n` segment terminators; any HL7 2.x version; unknown segments (ORC, NTE, PV1,
 Z-segments) ignored; multiple OBR per message supported; repeated PID-3 uses the first repetition; `\.br\`, `\F\`
@@ -106,36 +113,40 @@ etc. decoded; charset from MSH-18, else strict UTF-8, else ISO-8859-1 fallback (
 
 ## Decisions and Tradeoffs
 
-**1. Receipt and verdict are separate: `200 + AA` the moment the bytes are stored; validation runs asynchronously.**
-Woodbine's sender retries on non-2xx (per Maya). A malformed message is a *permanent* failure; answering `4xx` would
-make their engine retry it forever. So the receiver's contract is deliberately narrow — *we either have the file or we
-don't* — and everything about content happens afterwards, in a background worker fed from the `messages` table.
-Two things fall out: the receiving code is trivially simple and hard to break, and a burst from one provider (their
-queue backing up, per Maya) can't slow down *receipt* for anyone else. The trade-off, stated plainly: **the sender
-never learns about a rejection through the ACK** — a bad message becomes our operational problem (quarantine,
-`GET /messages?status=rejected`, warning-level logs, and, with more time, alerting), not something their engine
-error-queues. Given Maya couldn't confirm they even read the ACK, and given that immediate-AA-then-process is what
-interface engines do by default, that is acceptable — but it should be confirmed with Woodbine (see assumptions).
-The ACK code is `AA`, not HL7's more precise `CA` (commit accept), because `CA` only exists in enhanced-ack mode and
-Woodbine's messages are original mode, where the sender expects `AA`. Rejected: synchronous validation with the
-verdict in the ACK (`AE`/`AR` + `ERR`) — the first version of this service, still in git history (`d2a41b1`); more
-informative for the sender, but couples receipt to processing and lets a burst delay other providers' 200s.
-Rejected: honest REST (`400/422` for content errors) — wrong for a retrying sender.
+**1. Validate synchronously and ACK honestly; write the reports asynchronously.**
+Two facts drive the response contract. Woodbine's sender retries on non-2xx (per Maya), so a malformed message must
+not get a `4xx` — it would be retried forever; the HTTP status therefore only says "we have your bytes" (`200`) or
+"we don't — retry" (`5xx`), and the *ACK* carries the verdict. And an ACK is only worth sending if it's true, so
+validation — parse, envelope, extraction, required fields, duplicate check — runs in the request, before the row is
+written and before the ACK goes out. It's pure in-memory work, ~1 ms. What is deferred to the background worker is
+the part that isn't needed for the verdict and is where heavier work will accumulate: writing `reports` /
+`observations` (later: patient matching, embedded documents, notifications). So the sender gets `AE`/`AR` + `ERR`
+for a bad message immediately and can error-queue it on their side, `AA` for a good one, and the reports appear
+milliseconds later. History, because it's the honest story: the first version did everything synchronously
+(`d2a41b1`); the second moved *all* processing behind the queue and ACKed `AA` on receipt for everything (`322b753`)
+— simpler receiver, burst-proof, and **wrong**, because it told the sender "accepted" for messages we later rejected
+and left rejections invisible to them; this version keeps the async seam where it earns its keep and puts the
+verdict back where the sender can see it. Rejected: `AA`-for-everything (above); honest REST (`400/422` for content
+errors — wrong for a retrying sender); `CA` (commit accept) instead of `AA` — only exists in enhanced-ack mode, and
+Woodbine's messages are original mode.
 
-**2. Store every payload raw first; the `messages` table is the queue, the audit trail, the quarantine, and the
-idempotency ledger. Idempotency by (facility, app, control ID).**
-One table, one row per request, one `status` column: `received` is the work queue (durable across restarts — the
+**2. Every payload is stored raw with its verdict, in one write, before the ACK; the `messages` table is the work
+queue, the audit trail, the quarantine, and the idempotency ledger. Idempotency by (facility, app, control ID).**
+One table, one row per request, one `status` column: `queued` is the work queue (durable across restarts — the
 worker sweeps it on startup), `rejected`/`failed` is the quarantine (bytes kept, replayable after a parser fix or a
 conversation with Woodbine), `accepted`/`duplicate` is the ledger. No broker to run, no second store to keep
-consistent, and the demo can *see* the queue with a `SELECT`. A single FIFO worker keeps per-sender ordering (a
-correction must not overtake its original) and SQLite is single-writer anyway. Duplicates are keyed by sender *and*
-control ID because two providers can both send `MSG00001`; only *accepted* messages participate, so a corrected
-re-send of a previously rejected message is accepted; verdict writes are guarded by `status = 'received'` so a
-verdict is recorded exactly once. Rejected: parse-then-store (a bug in our parser could lose data); an external
-queue (Redis/RabbitMQ) — real leverage only past SQLite's ceiling, which 500/day isn't near; control-ID-only keys;
-overwriting on duplicate (04's differing body is exactly the case where overwriting is dangerous, so we keep the
-original and flag the mismatch). Known limit: a burst from provider A delays *processing* (not receipt) of provider
-B's messages behind it; per-facility worker lanes are the next step if that ever matters.
+consistent, and the demo can *see* the queue with a `SELECT`. The duplicate check and the INSERT share one
+`BEGIN IMMEDIATE` transaction, so two concurrent retries can't both be queued; a partial unique index over live
+(`queued`/`accepted`) rows is the backstop; the queued→terminal `UPDATE` is guarded by `status = 'queued'` so the
+transition happens exactly once. A single FIFO worker keeps per-sender ordering (a correction must not overtake its
+original) and SQLite is single-writer anyway. Duplicates are keyed by sender *and* control ID because two providers
+can both send `MSG00001`; only live messages participate, so a corrected re-send of a previously rejected message is
+accepted. Rejected: an external queue (Redis/RabbitMQ) — real leverage only past SQLite's ceiling, which 500/day
+isn't near; control-ID-only keys; overwriting on duplicate (04's differing body is exactly the case where
+overwriting is dangerous, so we keep the original and flag the mismatch); storing before validating (two writes per
+message for no gain — nothing is lost either way, because no ACK leaves before the row commits, so a crash mid-request
+just means the sender retries). Known limit: a burst from provider A delays *report-writing* (not receipt or the
+ACK) for provider B behind it; per-facility worker lanes are the next step if that ever matters.
 
 **3. A schema-free HL7 library plus our own policy layer, with a per-provider profile seam.**
 [HL7-V2](https://www.nuget.org/packages/HL7-V2) (MIT, no dependencies) does the tokenizing, delimiter handling,
@@ -169,8 +180,9 @@ Maya's assistant could not answer these; the defaults below are documented in co
 | Accession number = OBR-3.1 (filler order number) | `ProviderProfile.Default` | Change one `FieldRef` |
 | Patient identifier = PID-3.1 (first repetition, MRN) | `ProviderProfile.Default` | Same |
 | A standard HL7 ACK is expected; sender retries on non-2xx | Maya | Response mapping is one class (`MessagesEndpoint`) |
-| An immediate `AA` ("received") is acceptable to Woodbine, i.e. they do **not** need the validation verdict in the ACK and are OK with rejections being surfaced by us (`GET /messages`, alerts) rather than error-queued on their side | Maya couldn't say | Re-introduce synchronous validation with `AE`/`AR` in the ACK for that provider (the first version of this service; git `d2a41b1`) — a per-provider option off `ProviderProfile` |
-| Original-mode acknowledgement (MSH-15/16 empty, as in the samples) | samples | If they run enhanced mode, answer `CA` instead of `AA` |
+| Woodbine's engine *reads* the ACK (`MSA-1`/`ERR`) and someone monitors `AE`/`AR` on their side — otherwise our rejections are only visible here | Maya couldn't say | Add rejection alerting on our side and/or a notification path to their ops |
+| Their engine treats `200 + AE/AR` as "delivered, don't retry" and error-queues it | Maya couldn't say | If it retries on non-AA, re-sends of rejected messages are harmless here (rejected rows aren't deduplicated) but noisy |
+| Original-mode acknowledgement (MSH-15/16 empty, as in the samples) | samples | If they run enhanced mode, add `CA`/`CE`/`CR` commit acks |
 | Encoding UTF-8 unless MSH-18 says otherwise | `PayloadDecoder` | Add the charset to the switch |
 | Timestamps are Eastern (Ontario) but sent without offset | stored as-is | Apply the offset at read time / add a per-provider TZ |
 | Only `ORU^R01`; ADT is out of scope | `ValidationPolicy.Default` | Add the type to `AcceptedMessageTypes` and an extractor |
@@ -184,16 +196,16 @@ Maya's assistant could not answer these; the defaults below are documented in co
   ACK back is a contained addition.
 - **Security for PHI.** TLS termination, mTLS or API keys per provider, IP allowlist, sender allowlist (reject
   unknown MSH-4), request size limits, non-root container user, secrets management, audit of who read what.
-- **Operations.** Metrics (received/accepted/rejected/duplicate/failed per provider, queue depth, processing
+- **Operations.** Metrics (queued/accepted/rejected/duplicate/failed per provider, queue depth, processing
   latency), alerting on rejection spikes and on `pending` growing, a replay path for quarantined/failed messages
-  (`POST /messages/{id}/replay` = set status back to `received`), structured JSON logs with correlation IDs,
-  OpenTelemetry. With async processing, this is what tells Woodbine's ops about bad messages — it matters more now.
+  (`POST /messages/{id}/replay` = re-validate and set status back to `queued`), structured JSON logs with correlation
+  IDs, OpenTelemetry.
 - **Amendments and report lifecycle.** Preliminary → final → corrected (OBX-11 `P`/`F`/`C`, OBR-25). Today every
   message yields new report rows; add a "latest per (facility, accession)" view or an explicit supersedes link.
 - **Per-provider processing lanes.** One worker per sending facility (ordering preserved within a provider), so a
-  burst from one provider can't delay processing for another. Receipt is already isolated; this is about the verdict
-  latency. Also a per-provider "sync verdict in the ACK" option for engines that error-queue on `AE`/`AR`.
-- **Graceful drain on shutdown / a proper poison-message policy** — today an in-flight message is left `received`
+  burst from one provider can't delay report-writing for another. Receipt and the ACK are already isolated; this is
+  about the time between `AA` and `accepted`.
+- **Graceful drain on shutdown / a proper poison-message policy** — today an in-flight message is left `queued`
   and picked up on restart; a message that throws is marked `failed` after one attempt (no retries, no backoff).
 - **Report-centric reads.** Today's API is message-centric (what was sent, what happened). Add
   `GET /reports?accession=…&patientId=…&facility=…` for the PocketHealth-side question ("this patient's reports"),
@@ -207,13 +219,15 @@ Maya's assistant could not answer these; the defaults below are documented in co
 ## Notes for the Reviewer
 
 - Layout: `src/Hl7Receiver/{Hl7,Ingestion,Storage,Http}`; `Program.cs` is just wiring. Read it in this order:
-  `Http/MessagesEndpoint` → `Ingestion/MessageReceiver` (the hot path) → `Ingestion/ProcessingWorker` →
-  `Ingestion/MessageProcessor` (the pipeline) → `Hl7/*` (parser wrapper, extractor, validator, provider profile) →
-  `Storage/*`. Tests are in `tests/Hl7Receiver.Tests` — the eight samples are copied in as fixtures and drive
-  [`SampleBehaviorTests`](tests/Hl7Receiver.Tests/SampleBehaviorTests.cs); `EndpointTests` covers the leniency and
-  the provider seam; `AsyncProcessingTests` covers receipt-before-verdict, restart recovery, bursts and FIFO;
+  `Http/MessagesEndpoint` → `Ingestion/MessageReceiver` (sync: validate → store → ACK) →
+  `Ingestion/MessageEvaluator` (the pure pipeline both halves share) → `Ingestion/ProcessingWorker` →
+  `Ingestion/MessageProcessor` (async: re-extract → write reports) → `Hl7/*` (parser wrapper, extractor,
+  validator, provider profile, ACK builder) → `Storage/*`. Tests are in `tests/Hl7Receiver.Tests` — the eight
+  samples are copied in as fixtures and drive [`SampleBehaviorTests`](tests/Hl7Receiver.Tests/SampleBehaviorTests.cs);
+  `EndpointTests` covers the leniency and the provider seam; `AsyncProcessingTests` covers the sync/async seam
+  (rejections final at receipt, queued→accepted, duplicate-of-queued, restart recovery, bursts and FIFO);
   `ReadEndpointTests` covers the GET API; `UnitTests` covers the ACK builder, MSH sniffing, timestamps.
-- Tests run the real background worker; helpers poll `messages.status` until the verdict lands (milliseconds).
+- Tests run the real background worker; helpers poll `messages.status` until `queued` resolves (milliseconds).
 - Built and tested entirely inside Docker (no local SDK); what you run is what I ran.
 - AI use (Claude Code) is described in [PLAN.md](PLAN.md), including what was deliberately not delegated.
 - The container runs as root so the `./data` bind mount works on any host without permission games; a hardened
